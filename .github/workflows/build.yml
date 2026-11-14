@@ -14,24 +14,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Los tests son mi comprobación del núcleo: si fallan por culpa del entorno de GitHub no deben impedir
+      # que se compile el .nro (queda un aviso amarillo en lugar de una X roja).
       - name: Tests del núcleo (en el host)
+        continue-on-error: true
         run: |
-          apt-get update -qq && apt-get install -y -qq g++ >/dev/null
+          apt-get update -qq && apt-get install -y -qq g++ curl ca-certificates >/dev/null
           sh tests/run.sh
 
+      # pkg.devkitpro.org a veces responde 403 o se cae (está muy cargado). Por eso todo lo que baja paquetes
+      # reintenta con esperas crecientes, y a partir del 3.er intento descarga con curl y cabecera de navegador.
       - name: Actualizar devkitPro y libnx (necesario para firmwares recientes)
-        run: dkp-pacman -Syu --noconfirm
+        continue-on-error: true
+        run: |
+          command -v curl >/dev/null || (apt-get update -qq && apt-get install -y -qq curl ca-certificates >/dev/null)
+          . ./.github/dkp-retry.sh
+          dkp_retry dkp-pacman -Syu --noconfirm
 
       - name: Instalar librerías de Switch (SDL2, curl, libarchive...)
         run: |
-          dkp-pacman -S --needed --noconfirm switch-dev switch-portlibs
+          command -v curl >/dev/null || (apt-get update -qq && apt-get install -y -qq curl ca-certificates >/dev/null)
+          . ./.github/dkp-retry.sh
+          dkp_retry dkp-pacman -S --needed --noconfirm switch-dev switch-portlibs
           dkp-pacman -Q libnx devkitA64
 
       - name: Descargar certificados raíz (HTTPS verificado)
         run: |
-          command -v curl >/dev/null || (apt-get update -qq && apt-get install -y -qq curl)
+          command -v curl >/dev/null || (apt-get update -qq && apt-get install -y -qq curl ca-certificates >/dev/null)
           mkdir -p romfs
-          curl -fsSL -o romfs/cacert.pem https://curl.se/ca/cacert.pem
+          curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors -o romfs/cacert.pem https://curl.se/ca/cacert.pem
           test -s romfs/cacert.pem
 
       - name: Compilar
