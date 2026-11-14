@@ -12,7 +12,7 @@
 #include "util.hpp"
 
 #ifndef APP_VERSION_STR
-#define APP_VERSION_STR "1.0.0"
+#define APP_VERSION_STR "1.1.0"
 #endif
 
 namespace col = ui::col;
@@ -47,15 +47,29 @@ bool jobActive(const Job& j) {
     return s == Job::Queued || (s >= Job::Downloading && s <= Job::Installing);
 }
 
+std::string fmtEta(uint64_t sec) {
+    char b[32];
+    if (sec >= 3600) snprintf(b, sizeof b, "%llu:%02llu:%02llu", (unsigned long long)(sec / 3600), (unsigned long long)(sec / 60 % 60), (unsigned long long)(sec % 60));
+    else snprintf(b, sizeof b, "%llu:%02llu", (unsigned long long)(sec / 60), (unsigned long long)(sec % 60));
+    return b;
+}
+
 std::string jobStateText(const Job& j) {
     int s = j.state.load();
     int pct = (int)(j.prog.fraction() * 100.0);
     char b[160];
     switch (s) {
         case Job::Queued: return S("En cola", "Queued");
-        case Job::Downloading:
-            snprintf(b, sizeof b, "%s %d%%  (%s / %s)", T("Descargando", "Downloading"), pct, util::humanSize(j.prog.now.load()).c_str(), util::humanSize(j.prog.total.load()).c_str());
-            return b;
+        case Job::Downloading: {
+            const uint64_t now = j.prog.now.load(), tot = j.prog.total.load(), bps = j.prog.bps.load();
+            snprintf(b, sizeof b, "%s %d%%  (%s / %s)", T("Descargando", "Downloading"), pct, util::humanSize(now).c_str(), util::humanSize(tot).c_str());
+            std::string out = b;
+            if (bps > 0) {
+                out += "  -  " + util::humanSize(bps) + "/s";
+                if (tot > now) out += "  -  " + fmtEta((tot - now) / bps) + S(" restante", " left");
+            }
+            return out;
+        }
         case Job::Verifying:
             snprintf(b, sizeof b, "%s %d%%", T("Verificando MD5", "Verifying MD5"), pct);
             return b;
@@ -102,9 +116,9 @@ bool App::init(SDL_Renderer* r) {
     img_.init(r, paths::cache());
     store_.load();
     dl_.start();
+    startedAt_ = sys::nowMs();
     refreshStatus();
-    loadPage(1);
-    startUpdateCheck(false);
+    loadPage(1);  // la comprobación de actualizaciones espera unos segundos (ver frame): primero lo que se ve
     if (!http::tlsVerified()) toast(S("Aviso: sin certificados TLS (cacert.pem); las conexiones no se verifican", "Warning: no TLS certificates (cacert.pem); connections are not verified"), col::warn);
     return true;
 }
@@ -112,7 +126,9 @@ bool App::init(SDL_Renderer* r) {
 void App::shutdown() {
     bgCancel_ = true;
     confCancel_ = true;
+    http::abortAll();  // corta ya las peticiones en curso: salir no debe esperar a la red
     dl_.stop();
+    spaceJob_.join();
     pageJob_.join();
     detailJob_.join();
     updJob_.join();
@@ -122,11 +138,20 @@ void App::shutdown() {
     img_.shutdown();
     store_.save();
     http::shutdown();
+    util::flushLog();
 }
 
 void App::refreshStatus() {
-    freeSpace_ = util::freeSpace(paths::root() + "/");
     lastStatus_ = sys::nowMs();
+    if (spaceJob_.busy.load()) return;
+    spaceJob_.run([]() { return util::freeSpace(paths::root() + "/"); });  // en un hilo: statvfs en la SD tarda
+}
+
+void App::refreshImportCount() {
+    int n = 0;
+    for (const auto& f : util::listFiles(paths::importDir())) n += isArchiveName(f) ? 1 : 0;
+    importCount_ = n;
+    importDirty_ = false;
 }
 
 void App::toast(const std::string& msg, ui::Color c) {
@@ -178,20 +203,27 @@ std::string App::tabName(int t) {
 // ============================================================================ tareas en segundo plano
 
 void App::pollAsync() {
+    uint64_t space = 0;
+    if (spaceJob_.take(space)) freeSpace_ = space;
+
     gb::Page pg;
     if (pageJob_.take(pg)) {
-        pageLoaded_ = true;
-        if (pg.ok) {
-            page_ = std::move(pg);
-            pageNo_ = page_.page;
-            pageErr_.clear();
-            sel_ = 0;
-            browseScroll_.reset();
-        } else {
-            pageErr_ = pg.err;
-            pageNo_ = page_.page;
-            if (!page_.items.empty()) toast(S("No se pudo cargar la página: ", "Could not load page: ") + pg.err, col::bad);
+        if (pg.ok) rememberPage(jobKey_, pg);
+        if (jobKey_ == desiredKey_) {  // si el usuario ya pidió otra cosa, este resultado solo se guarda en caché
+            wantPending_ = false;
+            pageLoaded_ = true;
+            if (pg.ok) {
+                applyPage(std::move(pg));
+            } else {
+                pageErr_ = pg.err;
+                pageNo_ = page_.page;
+                if (!page_.items.empty()) toast(S("No se pudo cargar la página: ", "Could not load page: ") + pg.err, col::bad);
+            }
         }
+    }
+    if (wantPending_ && !pageJob_.busy.load()) {
+        wantPending_ = false;
+        startPageJob();
     }
 
     if (detailPending_ && !detailJob_.busy.load()) {
@@ -382,12 +414,50 @@ void App::queueDownload(const gb::Item& item, const gb::File& f) {
 
 // ============================================================================ explorar
 
-void App::loadPage(int page) {
-    if (pageJob_.busy.load()) return;
+std::string App::pageKey(int page) const {
+    return std::to_string(g_settings.gameId) + "|" + std::to_string(g_settings.perPage) + "|" + (query_.empty() ? std::string(gb::sortKey(sort_)) : "q:" + query_) + "|" + std::to_string(page);
+}
+
+void App::rememberPage(const std::string& key, const gb::Page& pg) {
+    if (pageCache_.find(key) == pageCache_.end()) pageOrder_.push_back(key);
+    pageCache_[key] = pg;
+    while (pageOrder_.size() > 16) {  // las más antiguas fuera
+        pageCache_.erase(pageOrder_.front());
+        pageOrder_.erase(pageOrder_.begin());
+    }
+}
+
+void App::applyPage(gb::Page&& pg) {
+    page_ = std::move(pg);
+    pageLoaded_ = true;
+    pageNo_ = page_.page;
     pageErr_.clear();
+    sel_ = 0;
+    browseScroll_.reset();
+}
+
+// Pide una página. Si ya se vio, se muestra al instante. Si hay otra carga en marcha, esta queda pendiente y
+// la anterior se descarta al llegar (antes se ignoraba la petición y se perdía, p. ej. una búsqueda).
+void App::loadPage(int page) {
+    const int p = std::max(1, page);
+    desiredPage_ = p;
+    desiredKey_ = pageKey(p);
+    pageErr_.clear();
+    auto it = pageCache_.find(desiredKey_);
+    if (it != pageCache_.end()) {
+        wantPending_ = false;
+        gb::Page copy = it->second;
+        applyPage(std::move(copy));
+        return;
+    }
+    wantPending_ = true;  // pollAsync la lanza en cuanto no haya otra en curso
+}
+
+void App::startPageJob() {
+    jobKey_ = desiredKey_;
     std::string q = query_;
     gb::Sort s = sort_;
-    int p = std::max(1, page);
+    int p = desiredPage_;
     int per = g_settings.perPage;
     pageJob_.run([q, s, p, per]() { return q.empty() ? gb::browse(p, s, per) : gb::search(q, p, per); });
 }
@@ -418,13 +488,12 @@ void App::ensureVisible(int sel, int cols, Scroller& s, int viewH) {
 }
 
 void App::updateBrowse(const Input& in) {
-    if (pageJob_.busy.load()) return;
-    const auto& items = page_.items;
+    const auto& items = page_.items;  // sigue siendo navegable mientras carga la página siguiente
     if (!items.empty()) {
         moveSel(sel_, (int)items.size(), COLS, in);
         ensureVisible(sel_, COLS, browseScroll_, H - FOOT - (HEAD + SUB) - 10);
         if (in.a) openDetail(items[(size_t)sel_]);
-    } else if (in.a) {
+    } else if (in.a && !pageJob_.busy.load() && !wantPending_) {
         loadPage(pageNo_);
     }
     if (in.y) {
@@ -444,10 +513,14 @@ void App::updateBrowse(const Input& in) {
     }
     if (in.minus) {
         query_.clear();
+        pageCache_.clear();  // "Inicio" también sirve para refrescar
+        pageOrder_.clear();
         loadPage(1);
     }
-    if (in.zr && !page_.complete && !items.empty()) loadPage(pageNo_ + 1);
-    if (in.zl && pageNo_ > 1) loadPage(pageNo_ - 1);
+    const bool loadingNow = pageJob_.busy.load() || wantPending_;
+    const int cur = loadingNow ? desiredPage_ : pageNo_;
+    if (in.zr && !items.empty() && !(page_.complete && cur == pageNo_)) loadPage(cur + 1);
+    if (in.zl && cur > 1) loadPage(cur - 1);
 }
 
 void App::drawBrowse() {
@@ -455,10 +528,18 @@ void App::drawBrowse() {
     ui::fill(0, HEAD, W, SUB, col::panel);
     std::string left = query_.empty() ? S("Orden: ", "Sort: ") + sortName(sort_) : S("Búsqueda: ", "Search: ") + "\"" + query_ + "\"";
     ui::text(left, 30, HEAD + 6, ui::SMALL, col::text, 700);
-    std::string right = S("Página ", "Page ") + std::to_string(pageNo_) + (page_.items.empty() ? "" : "   -   " + std::to_string(page_.items.size()) + S(" mods", " mods"));
+    const bool loadingNow = pageJob_.busy.load() || wantPending_;
+    const int shownPage = loadingNow ? desiredPage_ : pageNo_;
+    std::string right = S("Página ", "Page ") + std::to_string(shownPage);
+    {
+        const int per = std::max(1, g_settings.perPage);
+        const int pages = page_.total > 0 ? (int)((page_.total + per - 1) / per) : 0;
+        if (!loadingNow && pages >= pageNo_ && (int)page_.items.size() <= per && pages > 1) right += S(" de ", " of ") + std::to_string(pages);
+    }
+    if (!page_.items.empty()) right += "   -   " + std::to_string(page_.items.size()) + S(" mods", " mods");
     ui::text(right, W - 530, HEAD + 6, ui::SMALL, col::dim, 500, 2);
 
-    bool busy = pageJob_.busy.load();
+    bool busy = loadingNow;
     if (page_.items.empty()) {
         if (busy || !pageLoaded_) {
             drawCenterMessage(S("Cargando", "Loading") + std::string((size_t)((now_ / 350) % 4), '.'), S("Conectando con GameBanana", "Connecting to GameBanana"), col::text);
@@ -495,6 +576,7 @@ void App::drawBrowse() {
         drawCard(x, y, CW, CH, c);
     }
     ui::unclip();
+    ui::scrollbar(W - 14, areaY + 10, areaH - 20, areaH - 10, ((int)page_.items.size() + COLS - 1) / COLS * pitch, (int)browseScroll_.cur);
     if (busy) ui::text(S("Cargando", "Loading") + std::string((size_t)((now_ / 350) % 4), '.'), W - 230, HEAD + 6, ui::SMALL, col::accent, 200, 2);
 }
 
@@ -715,6 +797,7 @@ void App::drawInstalled() {
         drawCard(x, y, CW, CH, c);
     }
     ui::unclip();
+    ui::scrollbar(W - 14, areaY + 10, areaH - 20, areaH - 10, ((int)mods.size() + COLS - 1) / COLS * pitch, (int)instScroll_.cur);
 }
 
 // ============================================================================ descargas
@@ -743,6 +826,10 @@ void App::drawDownloads() {
     auto jobs = dl_.jobs();
     ui::fill(0, HEAD, W, SUB, col::panel);
     ui::text(std::to_string(dl_.activeCount()) + S(" activas   -   ", " active   -   ") + std::to_string(jobs.size()) + S(" en total", " total"), 30, HEAD + 6, ui::SMALL, col::text, 800);
+    uint64_t totalBps = 0;
+    for (const auto& jb : jobs)
+        if (jb->state.load() == Job::Downloading) totalBps += jb->prog.bps.load();
+    if (totalBps > 0) ui::text(S("Velocidad: ", "Speed: ") + util::humanSize(totalBps) + "/s", W - 430, HEAD + 6, ui::SMALL, col::accent, 400, 2);
     if (jobs.empty()) {
         drawCenterMessage(S("No hay descargas", "No downloads"), S("Las descargas e instalaciones aparecerán aquí", "Downloads and installs will show up here"), col::dim);
         return;
@@ -764,6 +851,7 @@ void App::drawDownloads() {
         ui::text(jobStateText(j), 48, y + 56, ui::SMALL, sc, W - 560);
         if (s >= Job::Downloading && s <= Job::Extracting) drawBar(W - 520, y + 58, 450, 14, j.prog.fraction(), col::accent);
     }
+    ui::scrollbar(W - 14, top, vis * rowH, vis * rowH, n * rowH, first * rowH);
 }
 
 // ============================================================================ perfiles
@@ -825,6 +913,7 @@ void App::drawProfiles() {
         if (missing) sub += "   -   " + std::to_string(missing) + S(" ya no están instalados", " no longer installed");
         ui::text(sub, 48, y + 34, ui::SMALL, missing ? col::warn : col::dim, W - 120);
     }
+    ui::scrollbar(W - 14, top, vis * rowH, vis * rowH, n * rowH, first * rowH);
 }
 
 // ============================================================================ herramientas
@@ -835,9 +924,7 @@ std::string App::toolLabel(int idx, std::string& value) const {
         case 0: return S("Buscar conflictos entre mods activados", "Find conflicts between enabled mods");
         case 1: return S("Buscar actualizaciones de los mods instalados", "Check installed mods for updates");
         case 2: {
-            int n = 0;
-            for (const auto& f : util::listFiles(paths::importDir())) n += isArchiveName(f) ? 1 : 0;
-            value = std::to_string(n) + S(" archivo(s)", " file(s)");
+            value = std::to_string(importCount_) + S(" archivo(s)", " file(s)");
             return S("Instalar archivos de switch/smash-mod-hub/import", "Install files from switch/smash-mod-hub/import");
         }
         case 3: return S("Activar todos los mods", "Enable all mods");
@@ -849,11 +936,12 @@ std::string App::toolLabel(int idx, std::string& value) const {
         case 9: value = std::to_string(g_settings.gameId); return S("ID del juego en GameBanana", "GameBanana game ID");
         case 10: return S("Borrar caché de imágenes", "Clear image cache");
         case 11: return S("Diagnóstico y registro", "Diagnostics and log");
+        case 12: value = std::to_string(g_settings.dlConns); return S("Conexiones por descarga (más = más rápido)", "Connections per download (more = faster)");
         default: return S("Salir", "Exit");
     }
 }
 
-static constexpr int kToolCount = 13;
+static constexpr int kToolCount = 14;
 
 void App::updateTools(const Input& in) {
     moveSel(toolSel_, kToolCount, 1, in);
@@ -921,6 +1009,15 @@ void App::activateTool(int idx) {
             toast(S("Caché de imágenes borrada", "Image cache cleared"), col::good);
             break;
         case 11: showDiagnostics(); break;
+        case 12: {
+            static const int opts[] = {1, 2, 3, 4, 6};
+            int next = opts[0];
+            for (int i = 0; i < 5; i++)
+                if (opts[i] == g_settings.dlConns) next = opts[(i + 1) % 5];
+            g_settings.dlConns = next;
+            g_settings.save();
+            break;
+        }
         default:
             if (dl_.activeCount() > 0) confirm(S("Salir", "Exit"), S("Hay descargas en curso. ¿Salir igualmente?", "Downloads are in progress. Exit anyway?"), [this]() { quit_ = true; });
             else quit_ = true;
@@ -935,12 +1032,14 @@ void App::runImport() {
         notice(S("Importar archivos", "Import files"), S("No hay archivos en switch/smash-mod-hub/import de la tarjeta SD.\nCopia allí .zip, .7z o .rar de mods y vuelve a pulsar esta opción.", "There are no files in switch/smash-mod-hub/import on the SD card.\nCopy mod .zip, .7z or .rar files there and select this option again."));
         return;
     }
+    importDirty_ = true;
     for (const auto& f : files) dl_.enqueueLocal(util::join(paths::importDir(), f), stem(f), paths::mods());
     toast(std::to_string(files.size()) + S(" archivo(s) en cola", " file(s) queued"), col::good);
     tab_ = TAB_DOWNLOADS;
 }
 
 void App::showDiagnostics() {
+    util::flushLog();
     std::vector<std::string> L;
     auto yn = [](bool b) { return b ? std::string("OK") : S("NO ENCONTRADO", "NOT FOUND"); };
     const std::string title = paths::smashTitleDir();
@@ -955,6 +1054,7 @@ void App::showDiagnostics() {
     L.push_back(S("SD libre: ", "SD free: ") + util::humanSize(util::freeSpace(paths::root() + "/")));
     L.push_back(S("TLS verificado: ", "TLS verified: ") + (http::tlsVerified() ? S("sí", "yes") : S("NO (falta romfs:/cacert.pem)", "NO (romfs:/cacert.pem missing)")));
     L.push_back(S("ID de juego GameBanana: ", "GameBanana game ID: ") + std::to_string(g_settings.gameId));
+    L.push_back(S("Conexiones por descarga: ", "Connections per download: ") + std::to_string(g_settings.dlConns));
     L.push_back("");
     L.push_back(S("Registro (ultimas lineas de log.txt):", "Log (last lines of log.txt):"));
     std::string text;
@@ -976,7 +1076,7 @@ void App::showDiagnostics() {
 }
 
 void App::drawTools() {
-    const int rowH = 44, top = HEAD + 10;
+    const int rowH = 42, top = HEAD + 8;
     for (int i = 0; i < kToolCount; i++) {
         std::string value;
         std::string label = toolLabel(i, value);
@@ -1007,8 +1107,14 @@ void App::drawCard(int x, int y, int w, int h, const Card& c) {
     ui::fill(x, y, w, h, c.selected ? col::panelHi : col::panel);
     const int ih = w * 9 / 16;
     ui::fill(x, y, w, ih, col::placeholder);
-    if (c.tex) ui::image(c.tex, x, y, w, ih);
-    else ui::text(c.noImage ? S("Sin imagen", "No image") : "...", x, y + ih / 2 - 12, ui::SMALL, col::dim, w, 1);
+    if (c.tex) {
+        ui::image(c.tex, x, y, w, ih);
+    } else if (c.noImage) {
+        ui::text(S("Sin imagen", "No image"), x, y + ih / 2 - 12, ui::SMALL, col::dim, w, 1);
+    } else {  // cargando: el recuadro "respira" en vez de quedarse quieto
+        const int pulse = (int)(18 + 14 * std::sin((double)now_ / 260.0));
+        ui::fill(x, y, w, ih, ui::Color(255, 255, 255, (uint8_t)pulse));
+    }
     if (c.dim) ui::fill(x, y, w, ih, ui::Color(0, 0, 0, 150));
     int bx = x + 8;
     for (const auto& b : c.badges) {
@@ -1071,9 +1177,12 @@ void App::drawToast() {
     if (now_ >= toastUntil_ || toastMsg_.empty()) return;
     int tw = std::min(W - 80, ui::textWidth(toastMsg_, ui::NORMAL) + 48);
     int x = (W - tw) / 2, y = H - FOOT - 62;
-    ui::fill(x, y, tw, 46, ui::Color(8, 9, 14, 235));
-    ui::outline(x, y, tw, 46, toastCol_, 2);
-    ui::text(toastMsg_, x, y + 8, ui::NORMAL, toastCol_, tw, 1);
+    // se desvanece en los últimos 400 ms
+    const uint64_t left = toastUntil_ - now_;
+    const int a = left >= 400 ? 255 : (int)(255 * left / 400);
+    ui::fill(x, y, tw, 46, ui::Color(8, 9, 14, (uint8_t)(235 * a / 255)));
+    ui::outline(x, y, tw, 46, toastCol_.withAlpha((uint8_t)a), 2);
+    ui::text(toastMsg_, x, y + 8, ui::NORMAL, toastCol_.withAlpha((uint8_t)a), tw, 1);
 }
 
 void App::drawDialog() {
@@ -1148,6 +1257,7 @@ void App::updateMain(const Input& in) {
     }
     if (in.l || in.r) {
         tab_ = (tab_ + (in.l ? TAB_COUNT - 1 : 1)) % TAB_COUNT;
+        importDirty_ = true;
         return;
     }
     switch (tab_) {
@@ -1161,7 +1271,12 @@ void App::updateMain(const Input& in) {
 
 void App::frame(const Input& in) {
     now_ = sys::nowMs();
-    if (now_ - lastStatus_ > 5000) refreshStatus();
+    if (now_ - lastStatus_ > 15000) refreshStatus();
+    if (!autoUpdChecked_ && now_ - startedAt_ > 6000 && pageLoaded_) {
+        autoUpdChecked_ = true;
+        startUpdateCheck(false);
+    }
+    if (tab_ == TAB_TOOLS && importDirty_) refreshImportCount();
     img_.pump();
     pollAsync();
     handleFinishedJobs();
@@ -1183,4 +1298,5 @@ void App::frame(const Input& in) {
     if (view_.open) drawView();
     drawToast();
     if (dialog_.open) drawDialog();
+    ui::endFrame();
 }

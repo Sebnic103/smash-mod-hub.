@@ -7,6 +7,7 @@ struct Settings {
     bool keepArchives = false;  // conservar los .zip/.7z/.rar descargados
     bool verifyMd5 = true;      // comprobar MD5 si GameBanana lo informa
     int perPage = 20;           // resultados por página
+    int dlConns = 4;            // conexiones en paralelo para descargar un archivo (1 = una sola)
 
     void load();
     void save() const;

@@ -53,6 +53,7 @@ enum class Sort { Default, New, Updated };
 const char* sortKey(Sort s);
 
 void setGameId(int id);
+void clearFeedCache();  // olvida las páginas del plan B de la búsqueda (los tests lo usan)
 int gameId();
 
 Page browse(int page, Sort sort, int perPage);

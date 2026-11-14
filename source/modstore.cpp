@@ -9,11 +9,6 @@
 // ------------------------------------------------------------------ Mod
 std::string Mod::dir() const { return util::join(enabled ? paths::mods() : paths::modsDisabled(), folder); }
 
-std::string Mod::imagePath() const {
-    if (!meta.thumb.empty() && util::isFile(meta.thumb)) return meta.thumb;
-    return localPreview;
-}
-
 // ------------------------------------------------------------------ info.toml
 static void parseInfoToml(const std::string& path, Mod& m) {
     std::string text;
@@ -126,15 +121,34 @@ void ModStore::load() {
             m.enabled = enabled;
             auto it = db_.find(name);
             if (it != db_.end()) m.meta = it->second;
-            std::string full = util::join(dir, name);
-            parseInfoToml(util::join(full, "info.toml"), m);
-            for (const char* p : {"preview.webp", "preview.png", "preview.jpg", "preview.jpeg"}) {
-                std::string pp = util::join(full, p);
-                if (util::isFile(pp)) {
-                    m.localPreview = pp;
-                    break;
+            const std::string full = util::join(dir, name);
+            auto sc0 = scanCache_.find(name);
+            if (sc0 == scanCache_.end()) {
+                parseInfoToml(util::join(full, "info.toml"), m);
+                for (const char* p : {"preview.webp", "preview.png", "preview.jpg", "preview.jpeg"}) {
+                    std::string pp = util::join(full, p);
+                    if (util::isFile(pp)) {
+                        m.localPreview = pp;
+                        break;
+                    }
                 }
+                Scanned sn;
+                sn.infoName = m.infoName;
+                sn.infoAuthor = m.infoAuthor;
+                sn.infoVersion = m.infoVersion;
+                sn.infoCategory = m.infoCategory;
+                sn.localPreview = m.localPreview;
+                scanCache_[name] = sn;
+            } else {
+                m.infoName = sc0->second.infoName;
+                m.infoAuthor = sc0->second.infoAuthor;
+                m.infoVersion = sc0->second.infoVersion;
+                m.infoCategory = sc0->second.infoCategory;
+                m.localPreview = sc0->second.localPreview;
             }
+            // La ruta del preview depende de si el mod está activado o no.
+            if (!m.localPreview.empty()) m.localPreview = util::join(full, util::baseName(m.localPreview));
+            m.image = (!m.meta.thumb.empty() && util::isFile(m.meta.thumb)) ? m.meta.thumb : m.localPreview;
             auto sc = sizeCache_.find(name);
             if (sc != sizeCache_.end()) {
                 m.size = sc->second;
@@ -215,6 +229,7 @@ bool ModStore::remove(size_t idx, std::string& err) {
     std::string thumb = m.meta.thumb;
     db_.erase(m.folder);
     sizeCache_.erase(m.folder);
+    scanCache_.erase(m.folder);
     for (auto& p : profiles_) p.second.erase(std::remove(p.second.begin(), p.second.end(), m.folder), p.second.end());
     mods_.erase(mods_.begin() + (long)idx);
     if (!thumb.empty()) {  // borra la miniatura si ningún otro mod la usa
@@ -229,6 +244,7 @@ bool ModStore::remove(size_t idx, std::string& err) {
 void ModStore::recordInstall(const std::string& folder, const Meta& meta) {
     db_[folder] = meta;
     sizeCache_.erase(folder);
+    scanCache_.erase(folder);
     save();
 }
 

@@ -21,6 +21,7 @@ struct Mod {
     // Datos de info.toml (opcional, lo usa ARCropolis)
     std::string infoName, infoAuthor, infoVersion, infoCategory;
     std::string localPreview;  // preview.webp/png/jpg dentro del mod, si existe
+    std::string image;         // imagen a mostrar (se calcula al cargar: no tocar la SD en cada frame)
     uint64_t size = 0;
     bool sizeKnown = false;
 
@@ -31,7 +32,7 @@ struct Mod {
     std::string version() const { return !meta.version.empty() ? meta.version : infoVersion; }
     std::string dir() const;  // ruta completa actual
     // Imagen a mostrar: miniatura descargada o preview.webp del propio mod ("" si no hay)
-    std::string imagePath() const;
+    const std::string& imagePath() const { return image; }
 };
 
 struct Conflict {
@@ -73,6 +74,12 @@ private:
     std::map<std::string, Meta> db_;
     std::map<std::string, std::vector<std::string>> profiles_;
     std::map<std::string, uint64_t> sizeCache_;
+    // Lo leído de cada carpeta (info.toml, preview): recargar la lista tras una descarga ya no vuelve a
+    // abrir los archivos de todos los mods. Se invalida por carpeta al instalar/borrar.
+    struct Scanned {
+        std::string infoName, infoAuthor, infoVersion, infoCategory, localPreview;
+    };
+    std::map<std::string, Scanned> scanCache_;
 };
 
 // Busca archivos repetidos entre mods activados. Pensado para correr en un hilo aparte.

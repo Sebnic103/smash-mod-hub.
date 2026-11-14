@@ -12,6 +12,7 @@ void ImageCache::init(SDL_Renderer* renderer, const std::string& diskDir, int wo
     dir_ = diskDir;
     util::mkdirs(dir_);
     quit_ = false;
+    cancel_.cancel = false;
     for (int i = 0; i < workers; i++) {
         auto t = std::make_unique<sys::Thread>();
         t->start([this] { workerLoop(); }, 0x100000);
@@ -21,6 +22,7 @@ void ImageCache::init(SDL_Renderer* renderer, const std::string& diskDir, int wo
 
 void ImageCache::shutdown() {
     quit_ = true;
+    cancel_.cancel = true;
     for (auto& t : workers_) t->join();
     workers_.clear();
     sys::Lock l(mx_);
@@ -31,6 +33,7 @@ void ImageCache::shutdown() {
     map_.clear();
     queue_.clear();
     texCount_ = 0;
+    nReady_ = 0;
 }
 
 SDL_Texture* ImageCache::get(const std::string& src, bool isUrl) {
@@ -65,6 +68,7 @@ void ImageCache::invalidate(const std::string& src) {
         if (texCount_ > 0) texCount_--;
     }
     if (it->second.surf) SDL_FreeSurface(it->second.surf);
+    if (it->second.st == St::Ready && nReady_ > 0) nReady_--;
     map_.erase(it);
 }
 
@@ -76,21 +80,25 @@ void ImageCache::clearDisk() {
 void ImageCache::pump(int maxUploads) {
     sys::Lock l(mx_);
     frame_++;
-    int uploaded = 0;
-    for (auto& kv : map_) {
-        Entry& e = kv.second;
-        if (e.st != St::Ready || uploaded >= maxUploads) continue;
-        e.tex = SDL_CreateTextureFromSurface(r_, e.surf);
-        SDL_FreeSurface(e.surf);
-        e.surf = nullptr;
-        e.lastUse = frame_;
-        if (e.tex) {
-            e.st = St::Done;
-            texCount_++;
-            uploaded++;
-        } else {
-            e.st = St::Failed;
-            e.failedAt = sys::nowMs();
+    if (nReady_ > 0) {
+        int budget = maxUploads * 4;  // una imagen grande gasta más que una miniatura
+        for (auto& kv : map_) {
+            Entry& e = kv.second;
+            if (e.st != St::Ready) continue;
+            if (budget <= 0) break;
+            budget -= (e.surf && (int64_t)e.surf->w * e.surf->h > 300000) ? 4 : 1;
+            e.tex = SDL_CreateTextureFromSurface(r_, e.surf);
+            SDL_FreeSurface(e.surf);
+            e.surf = nullptr;
+            e.lastUse = frame_;
+            nReady_--;
+            if (e.tex) {
+                e.st = St::Done;
+                texCount_++;
+            } else {
+                e.st = St::Failed;
+                e.failedAt = sys::nowMs();
+            }
         }
     }
     // Expulsa las texturas menos usadas si hay demasiadas (se vuelven a cargar desde el disco).
@@ -114,7 +122,7 @@ SDL_Surface* ImageCache::load(const std::string& src, bool isUrl) {
     if (isUrl) {
         path = dir_ + "/" + util::fnvHex(src) + ".img";
         if (!util::isFile(path) || util::fileSize(path) == 0) {
-            http::Result r = http::download(src, path, nullptr);
+            http::Result r = http::download(src, path, &cancel_);
             if (!r.ok()) return nullptr;
         }
     }
@@ -147,16 +155,35 @@ void ImageCache::workerLoop() {
         bool isUrl = false;
         {
             sys::Lock l(mx_);
-            while (!queue_.empty()) {
-                std::string k = queue_.front();
-                queue_.pop_front();
-                auto it = map_.find(k);
-                if (it != map_.end() && it->second.st == St::Queued) {
-                    it->second.st = St::Loading;
-                    isUrl = it->second.isUrl;
-                    key = k;
-                    break;
+            // Entre las pedidas, primero la más reciente (lo que se ve ahora); a igualdad, por orden de llegada.
+            // Las que llevan >2 s sin pedirse (ya no se ven) se tiran sin descargar.
+            size_t bestIdx = 0;
+            uint64_t bestUse = 0;
+            bool found = false;
+            for (size_t i = 0; i < queue_.size();) {
+                auto it = map_.find(queue_[i]);
+                if (it == map_.end() || it->second.st != St::Queued) {
+                    queue_.erase(queue_.begin() + (long)i);
+                    continue;
                 }
+                if (it->second.lastUse + kStaleFrames < frame_) {
+                    map_.erase(it);
+                    queue_.erase(queue_.begin() + (long)i);
+                    continue;
+                }
+                if (!found || it->second.lastUse > bestUse) {
+                    found = true;
+                    bestUse = it->second.lastUse;
+                    bestIdx = i;
+                }
+                i++;
+            }
+            if (found) {
+                key = queue_[bestIdx];
+                queue_.erase(queue_.begin() + (long)bestIdx);
+                Entry& e = map_[key];
+                e.st = St::Loading;
+                isUrl = e.isUrl;
             }
         }
         if (key.empty()) {
@@ -173,6 +200,7 @@ void ImageCache::workerLoop() {
         if (s) {
             it->second.surf = s;
             it->second.st = St::Ready;
+            nReady_++;
         } else {
             it->second.st = St::Failed;
             it->second.failedAt = sys::nowMs();

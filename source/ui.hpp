@@ -47,8 +47,13 @@ int textWrapped(const std::string& s, int x, int y, int w, FontSize f, Color c, 
 void image(SDL_Texture* t, int x, int y, int w, int h);         // rellena recortando (cover)
 void imageContain(SDL_Texture* t, int x, int y, int w, int h);  // entra entera (contain)
 
+// Barra de desplazamiento fina (x,y,h = pista; viewH/contentH/pos en píxeles del contenido).
+void scrollbar(int x, int y, int h, int viewH, int contentH, int pos, Color c = col::dim);
+
 void clip(int x, int y, int w, int h);
 void unclip();
 void clearTextCache();
+// Llamar al final de cada frame: reparte la creación de texturas de texto y limpia la caché (LRU).
+void endFrame();
 
 }  // namespace ui

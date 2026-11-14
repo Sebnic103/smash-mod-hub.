@@ -107,6 +107,7 @@ int Downloads::activeCount() {
 }
 
 void Downloads::run() {
+    uint64_t lastTrim = sys::nowMs();
     while (!quit_.load()) {
         std::shared_ptr<Job> job;
         {
@@ -121,6 +122,11 @@ void Downloads::run() {
         }
         if (!job) {
             sys::sleepMs(100);
+            if (sys::nowMs() - lastTrim > 2000) {
+                lastTrim = sys::nowMs();
+                http::trimIdle();
+                util::flushLog();  // el registro se guarda en bloques; aquí, sin molestar a la interfaz
+            }
             continue;
         }
         process(*job);
@@ -155,7 +161,7 @@ void Downloads::process(Job& j) {
         j.state = Job::Downloading;
         j.prog.now = 0;
         j.prog.total = j.file.size;
-        http::Result r = http::download(j.file.url, archive, &j.prog);
+        http::Result r = http::downloadBig(j.file.url, archive, &j.prog, g_settings.dlConns);
         if (j.prog.cancel.load()) return cancelled();
         if (!r.ok()) return fail(std::string(T("Descarga fallida: ", "Download failed: ")) + r.describe());
     }

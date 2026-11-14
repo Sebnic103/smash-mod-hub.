@@ -17,6 +17,9 @@ void Settings::load() {
     perPage = (int)v["per_page"].i64(perPage);
     if (perPage < 8) perPage = 8;
     if (perPage > 50) perPage = 50;
+    dlConns = (int)v["dl_conns"].i64(dlConns);
+    if (dlConns < 1) dlConns = 1;
+    if (dlConns > 6) dlConns = 6;
     if (gameId <= 0) gameId = 6498;
 }
 
@@ -27,5 +30,6 @@ void Settings::save() const {
     v.set("keep_archives", json::Value::B(keepArchives));
     v.set("verify_md5", json::Value::B(verifyMd5));
     v.set("per_page", json::Value::N(perPage));
+    v.set("dl_conns", json::Value::N(dlConns));
     util::writeFileAtomic(paths::settingsFile(), v.dump(2));
 }

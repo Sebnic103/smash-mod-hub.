@@ -40,6 +40,13 @@ private:
     Mutex& m_;
 };
 
+// Llamar una vez al arrancar (desde el hilo principal). En la Switch averigua qué núcleos tiene el proceso
+// para poder mandar los hilos de fondo a núcleos distintos del de la interfaz.
+void initThreads();
+
+// Hilo de fondo: en la Switch corre con prioridad MENOR que el hilo principal (la interfaz lo interrumpe
+// siempre) y, si hay otro núcleo libre, en ese núcleo. Así las descargas, el JSON, TLS o la decodificación
+// de imágenes no dejan la interfaz congelada.
 class Thread {
 public:
     Thread() = default;

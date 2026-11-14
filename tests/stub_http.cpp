@@ -13,6 +13,8 @@ std::string Result::describe() const { return error.empty() ? "HTTP " + std::to_
 void init(const std::string&) {}
 void shutdown() {}
 bool tlsVerified() { return true; }
+void trimIdle() {}
+void abortAll() {}
 
 Result get(const std::string& url, std::string& body, Progress*, long) {
     g_requested.push_back(url);
@@ -29,6 +31,12 @@ Result get(const std::string& url, std::string& body, Progress*, long) {
 }
 
 Result download(const std::string&, const std::string&, Progress*) {
+    Result r;
+    r.error = "stub";
+    return r;
+}
+
+Result downloadBig(const std::string&, const std::string&, Progress*, int) {
     Result r;
     r.error = "stub";
     return r;

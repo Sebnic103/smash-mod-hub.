@@ -16,10 +16,20 @@ struct Result {
 void init(const std::string& caPath);
 void shutdown();
 bool tlsVerified();
+// Cierra las conexiones que llevan >30 s sin usarse (llamar de vez en cuando desde un hilo de fondo).
+void trimIdle();
+// Al salir de la app: corta de inmediato todas las transferencias en curso (y las nuevas fallan rápido).
+void abortAll();
 
 // GET a memoria (JSON, etc.)
 Result get(const std::string& url, std::string& body, Progress* progress = nullptr, long timeoutSec = 30);
-// Descarga a disco (escribe en dest + ".part" y renombra al terminar).
-Result download(const std::string& url, const std::string& dest, Progress* progress);
+
+// Descarga pequeña a disco (miniaturas, imágenes): una sola conexión, reutilizada entre peticiones y sin
+// escribir nada en el registro si sale bien. Escribe en dest + ".part" y renombra al terminar.
+Result download(const std::string& url, const std::string& dest, Progress* progress = nullptr);
+
+// Descarga de un archivo grande (mod): hasta "conns" conexiones en paralelo si el servidor admite Range;
+// si no, o si algo falla, una sola conexión. Actualiza progress->now/total/bps.
+Result downloadBig(const std::string& url, const std::string& dest, Progress* progress, int conns);
 
 }  // namespace http

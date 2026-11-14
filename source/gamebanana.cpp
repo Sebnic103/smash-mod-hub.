@@ -3,6 +3,7 @@
 #include <algorithm>
 
 #include "http.hpp"
+#include "sys.hpp"
 #include "util.hpp"
 
 namespace gb {
@@ -10,7 +11,23 @@ namespace gb {
 static int g_gameId = 6498;
 static const char* kApi = "https://gamebanana.com/apiv11";
 
-void setGameId(int id) { g_gameId = id > 0 ? id : 6498; }
+// Páginas del feed que usa el plan B de la búsqueda: se guardan 10 minutos para que buscar varias veces no
+// vuelva a bajar y analizar 6 páginas de JSON cada vez.
+static sys::Mutex g_feedMx;
+static std::vector<Page> g_feed;
+static uint64_t g_feedAt = 0;
+static const uint64_t kFeedTtlMs = 10 * 60 * 1000;
+
+void clearFeedCache() {
+    sys::Lock l(g_feedMx);
+    g_feed.clear();
+    g_feedAt = 0;
+}
+
+void setGameId(int id) {
+    g_gameId = id > 0 ? id : 6498;
+    clearFeedCache();
+}
 int gameId() { return g_gameId; }
 
 const char* sortKey(Sort s) {
@@ -185,6 +202,24 @@ Page browse(int page, Sort sort, int perPage) {
 
 static std::string lowerContains(const std::string& hay) { return util::lower(hay); }
 
+static Page feedPage(int pg) {
+    const uint64_t now = sys::nowMs();
+    {
+        sys::Lock l(g_feedMx);
+        if (g_feedAt && now - g_feedAt < kFeedTtlMs && (size_t)pg <= g_feed.size()) return g_feed[(size_t)pg - 1];
+    }
+    Page f = browse(pg, Sort::Default, 50);
+    if (f.ok) {
+        sys::Lock l(g_feedMx);
+        if (!g_feedAt || now - g_feedAt >= kFeedTtlMs) {
+            g_feed.clear();
+            g_feedAt = now;
+        }
+        if ((size_t)pg == g_feed.size() + 1) g_feed.push_back(f);
+    }
+    return f;
+}
+
 Page search(const std::string& query, int page, int perPage) {
     std::string url = std::string(kApi) + "/Util/Search/Results?_sSearchString=" + util::urlEncode(query) + "&_idGameRow=" + std::to_string(g_gameId) + "&_sModelName=Mod&_nPage=" + std::to_string(page) + "&_nPerpage=" + std::to_string(perPage);
     Page p = fetchPage(url, page);
@@ -196,7 +231,7 @@ Page search(const std::string& query, int page, int perPage) {
     std::string q = util::lower(query);
     bool anyOk = false;
     for (int pg = 1; pg <= 6; pg++) {
-        Page f = browse(pg, Sort::Default, 50);
+        Page f = feedPage(pg);
         if (!f.ok) {
             if (!anyOk) out.err = f.err;
             break;

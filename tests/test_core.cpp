@@ -2,13 +2,18 @@
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
+#include <chrono>
 #include <map>
+#include <thread>
 
 #include "../source/gamebanana.hpp"
 #include "../source/installer.hpp"
 #include "../source/json.hpp"
 #include "../source/md5.hpp"
 #include "../source/modstore.hpp"
+#include "../source/segdl.hpp"
+#include "../source/sys.hpp"
 #include "../source/settings.hpp"
 #include "../source/util.hpp"
 
@@ -159,10 +164,19 @@ static void testGb() {
     g_canned.clear();
     g_canned["https://gamebanana.com/apiv11/Game/6498/Subfeed?_nPage=1"] = feed;
     g_requested.clear();
+    gb::clearFeedCache();
     gb::Page s = gb::search("mario", 1, 20);
     CHECK(s.ok);
     CHECK(s.items.size() == 1 && s.items[0].id == 11);
     CHECK(g_requested.size() >= 2 && g_requested[0].find("Util/Search/Results") != std::string::npos);
+    {  // segunda búsqueda: el feed sale de la caché (no hay nuevas peticiones a Subfeed)
+        size_t before = g_requested.size();
+        gb::Page s2 = gb::search("mario", 1, 20);
+        CHECK(s2.ok && s2.items.size() == 1);
+        int feedReqs = 0;
+        for (size_t i = before; i < g_requested.size(); i++) feedReqs += g_requested[i].find("Subfeed?_nPage=1&") != std::string::npos ? 1 : 0;  // la página 1 ya está en caché
+        CHECK(feedReqs == 0);
+    }
     gb::Page b = gb::browse(1, gb::Sort::New, 20);
     CHECK(b.ok && b.items.size() == 2);
     CHECK(g_requested.back().find("_sSort=new") != std::string::npos);
@@ -299,6 +313,228 @@ static void testInstallerAndStore() {
     g_settings = Settings();
 }
 
+
+// ---------------------------------------------------------------- descarga por trozos
+namespace {
+struct FakeTransport : http::Transport {
+    std::string data;
+    bool ranges = true;
+    bool probeOk = true;
+    bool ignoreRange = false;  // responde "no soporto Range" al pedir un trozo
+    int delayMs = 0;
+    std::atomic<int> failFirst{0};  // los primeros N intentos (de cualquier hilo) fallan
+    int alwaysFailChunk = -1;       // el trozo con este índice falla siempre
+    uint64_t chunk = 1 << 20;
+    std::atomic<int> calls{0}, cur{0}, maxConc{0};
+    std::atomic<uint64_t> usedEff{0}, usedOrig{0};
+    std::string effUrl = "https://cdn.example/final";
+    std::string effBad;  // si no está vacío, esa URL devuelve error siempre
+
+    http::Probe probe(const std::string&) override {
+        http::Probe p;
+        p.ok = probeOk;
+        p.ranges = ranges;
+        p.size = data.size();
+        p.url = effUrl;
+        p.status = 206;
+        return p;
+    }
+    http::FetchResult fetchRange(const std::string& url, uint64_t from, uint64_t to, std::string& out, const std::atomic<bool>& cancel, std::atomic<uint64_t>& received) override {
+        http::FetchResult r;
+        calls++;
+        int c = ++cur;
+        int m = maxConc.load();
+        while (c > m && !maxConc.compare_exchange_weak(m, c)) {
+        }
+        struct Dec { std::atomic<int>& x; ~Dec() { x--; } } dec{cur};
+        (url == effUrl ? usedEff : usedOrig)++;
+        if (ignoreRange) {
+            r.st = http::Fetch::Unsupported;
+            return r;
+        }
+        // Tarda distinto según el trozo para que terminen desordenados; reparte en pasos para poder cancelar.
+        int ms = delayMs ? (int)((from / chunk * 7) % (uint64_t)delayMs) + 1 : 0;
+        for (int i = 0; i < ms; i++) {
+            if (cancel.load()) {
+                r.st = http::Fetch::Cancelled;
+                return r;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (cancel.load()) {
+            r.st = http::Fetch::Cancelled;
+            return r;
+        }
+        if (!effBad.empty() && url == effBad) {
+            r.st = http::Fetch::Retry;
+            r.error = "HTTP 403";
+            return r;
+        }
+        if (failFirst.load() > 0 && failFirst.fetch_sub(1) > 0) {
+            r.st = http::Fetch::Retry;
+            r.error = "boom";
+            return r;
+        }
+        if (alwaysFailChunk >= 0 && from / chunk == (uint64_t)alwaysFailChunk) {
+            r.st = http::Fetch::Retry;
+            r.error = "siempre falla";
+            return r;
+        }
+        out.append(data, (size_t)from, (size_t)(to - from + 1));
+        received += to - from + 1;
+        return r;
+    }
+};
+
+std::string makeData(size_t n) {
+    std::string s(n, 0);
+    uint32_t x = 12345;
+    for (size_t i = 0; i < n; i++) {
+        x = x * 1664525u + 1013904223u;
+        s[i] = (char)(x >> 24);
+    }
+    return s;
+}
+
+// Ejecuta una descarga y devuelve lo escrito en el archivo.
+http::SegResult runSeg(FakeTransport& ft, http::SegOptions opt, std::string& written, Progress* prog = nullptr) {
+    FILE* f = tmpfile();
+    http::Probe p = ft.probe("https://x/dl");
+    http::SegResult r = http::segmentedDownload(ft, "https://x/dl", p, f, prog, opt);
+    fflush(f);
+    long n = ftell(f);
+    rewind(f);
+    written.assign((size_t)(n > 0 ? n : 0), 0);
+    if (n > 0) CHECK(fread(&written[0], 1, (size_t)n, f) == (size_t)n);
+    fclose(f);
+    return r;
+}
+}  // namespace
+
+static void testSegdl() {
+    printf("segdl\n");
+    for (size_t size : {(size_t)5500000, (size_t)(4u << 20), (size_t)(1u << 20) + 1, (size_t)1}) {
+        for (int conns : {1, 4, 6}) {
+            FakeTransport ft;
+            ft.data = makeData(size);
+            ft.delayMs = 6;
+            http::SegOptions o;
+            o.conns = conns;
+            std::string got;
+            Progress pr;
+            http::SegResult r = runSeg(ft, o, got, &pr);
+            CHECK(r.st == http::SegStatus::Done);
+            CHECK(got == ft.data);
+            CHECK(pr.now.load() == size && pr.total.load() == size);
+            CHECK(ft.maxConc.load() <= conns);
+        }
+    }
+    {  // muchos trozos pequeños con ventana mínima: todo en orden y sin bloquearse
+        FakeTransport ft;
+        ft.data = makeData(3000000);
+        ft.chunk = 64 * 1024;
+        ft.delayMs = 5;
+        http::SegOptions o;
+        o.conns = 4;
+        o.chunk = 64 * 1024;
+        o.window = 2;
+        std::string got;
+        http::SegResult r = runSeg(ft, o, got);
+        CHECK(r.st == http::SegStatus::Done);
+        CHECK(got == ft.data);
+        CHECK(ft.calls.load() == (int)((3000000 + 65535) / 65536));
+    }
+    {  // fallos pasajeros: se reintentan
+        FakeTransport ft;
+        ft.data = makeData(6u << 20);
+        ft.failFirst = 3;
+        http::SegOptions o;
+        std::string got;
+        http::SegResult r = runSeg(ft, o, got);
+        CHECK(r.st == http::SegStatus::Done);
+        CHECK(got == ft.data);
+        CHECK(ft.calls.load() == 6 + 3);
+    }
+    {  // la URL final falla (403): pasa a la original
+        FakeTransport ft;
+        ft.data = makeData(3u << 20);
+        ft.effBad = ft.effUrl;
+        http::SegOptions o;
+        std::string got;
+        http::SegResult r = runSeg(ft, o, got);
+        CHECK(r.st == http::SegStatus::Done);
+        CHECK(got == ft.data);
+        CHECK(ft.usedOrig.load() >= 3);
+    }
+    {  // un trozo falla siempre: error, y lo escrito es un prefijo correcto
+        FakeTransport ft;
+        ft.data = makeData(8u << 20);
+        ft.alwaysFailChunk = 3;
+        http::SegOptions o;
+        o.attempts = 2;
+        std::string got;
+        http::SegResult r = runSeg(ft, o, got);
+        CHECK(r.st == http::SegStatus::Failed);
+        CHECK(!r.error.empty() && !r.diskError);
+        CHECK(got.size() <= (size_t)(3u << 20));
+        CHECK(ft.data.compare(0, got.size(), got) == 0);
+    }
+    {  // el servidor no sirve trozos
+        FakeTransport ft;
+        ft.data = makeData(3u << 20);
+        ft.ignoreRange = true;
+        std::string got;
+        http::SegResult r = runSeg(ft, http::SegOptions(), got);
+        CHECK(r.st == http::SegStatus::Unsupported);
+    }
+    {  // la sonda no vale / no admite rangos: ni se intenta
+        FakeTransport ft;
+        ft.data = makeData(3u << 20);
+        ft.ranges = false;
+        std::string got;
+        http::SegResult r = runSeg(ft, http::SegOptions(), got);
+        CHECK(r.st == http::SegStatus::Unsupported);
+        CHECK(ft.calls.load() == 0);
+    }
+    {  // cancelar a mitad
+        FakeTransport ft;
+        ft.data = makeData(20u << 20);
+        ft.delayMs = 30;
+        Progress pr;
+        std::thread th([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(60));
+            pr.cancel = true;
+        });
+        std::string got;
+        uint64_t t0 = sys::nowMs();
+        http::SegResult r = runSeg(ft, http::SegOptions(), got, &pr);
+        th.join();
+        CHECK(r.st == http::SegStatus::Cancelled);
+        CHECK(sys::nowMs() - t0 < 3000);
+    }
+    {  // disco lleno
+        FakeTransport ft;
+        ft.data = makeData(3u << 20);
+        FILE* f = fopen("/dev/full", "wb");
+        if (f) {
+            setvbuf(f, nullptr, _IONBF, 0);
+            http::Probe p = ft.probe("u");
+            http::SegResult r = http::segmentedDownload(ft, "u", p, f, nullptr, http::SegOptions());
+            fclose(f);
+            CHECK(r.st == http::SegStatus::Failed && r.diskError);
+        }
+    }
+    {  // velocidad suavizada
+        SpeedMeter m;
+        CHECK(m.update(1000, 0) == 0);
+        CHECK(m.update(1200, 1000) == 0);  // ventana < 400 ms: sin cambios
+        uint64_t b = m.update(1500, 500000);
+        CHECK(b > 900000 && b < 1100000);  // ~1 MB/s
+        uint64_t b2 = m.update(2000, 500000);
+        CHECK(b2 < b);  // se frena y baja gradualmente
+    }
+}
+
 int main() {
     testJson();
     testMd5();
@@ -306,6 +542,7 @@ int main() {
     testSafeRelative();
     testGb();
     testInstallerAndStore();
+    testSegdl();
     printf(g_fail ? "\n%d FALLOS\n" : "\nTODO OK\n", g_fail);
     return g_fail ? 1 : 0;
 }

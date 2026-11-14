@@ -10,11 +10,35 @@
 
 #include "app.hpp"
 #include "platform.hpp"
+#include "sys.hpp"
 #include "ui.hpp"
 
-int main(int, char**) {
-    romfsInit();
+// Red con más margen que el de por defecto: búferes TCP de recepción grandes (ventana TCP mayor = más velocidad
+// en conexiones con latencia) y más sesiones BSD (con 3 solo pueden esperar datos 3 hilos a la vez; con las
+// descargas, las imágenes y la API a la vez, el resto se quedaba en cola). Si el sistema rechaza la
+// configuración se baja un escalón, y al final se usa la de por defecto.
+static void initNetwork() {
+    SocketInitConfig cfg = {};
+    cfg.tcp_tx_buf_size = 0x8000;
+    cfg.tcp_tx_buf_max_size = 0x20000;
+    cfg.tcp_rx_buf_size = 0x20000;
+    cfg.tcp_rx_buf_max_size = 0x100000;
+    cfg.udp_tx_buf_size = 0x2400;
+    cfg.udp_rx_buf_size = 0xA500;
+    cfg.sb_efficiency = 8;
+    cfg.bsd_service_type = BsdServiceType_User;
+    const u32 tries[] = {8, 4};
+    for (u32 sessions : tries) {
+        cfg.num_bsd_sessions = sessions;
+        if (R_SUCCEEDED(socketInitialize(&cfg))) return;
+    }
     socketInitializeDefault();
+}
+
+int main(int, char**) {
+    sys::initThreads();
+    romfsInit();
+    initNetwork();
     plInitialize(PlServiceType_User);
 
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");

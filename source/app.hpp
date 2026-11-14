@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <functional>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -81,6 +82,11 @@ private:
 
     // --- explorar
     void loadPage(int page);
+    std::string pageKey(int page) const;
+    void startPageJob();
+    void applyPage(gb::Page&& pg);
+    void rememberPage(const std::string& key, const gb::Page& pg);
+    void refreshImportCount();
     void updateBrowse(const Input& in);
     void drawBrowse();
     void openDetail(const gb::Item& it);
@@ -147,6 +153,12 @@ private:
     std::string query_, pageErr_;
     int sel_ = 0;
     Scroller browseScroll_;
+    // Páginas ya vistas (ir atrás/adelante es instantáneo) y petición pendiente mientras otra carga.
+    std::map<std::string, gb::Page> pageCache_;
+    std::vector<std::string> pageOrder_;
+    std::string desiredKey_, jobKey_;
+    int desiredPage_ = 1;
+    bool wantPending_ = false;
 
     // detalle
     bool detailOpen_ = false, detailPending_ = false, detLoaded_ = false;
@@ -185,4 +197,9 @@ private:
     // barra inferior
     uint64_t freeSpace_ = 0;
     uint64_t lastStatus_ = 0;
+    Async<uint64_t> spaceJob_;  // statvfs de la SD puede tardar: se mide en un hilo
+    int importCount_ = 0;
+    bool importDirty_ = true;
+    uint64_t startedAt_ = 0;
+    bool autoUpdChecked_ = false;
 };

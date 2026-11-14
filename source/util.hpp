@@ -62,5 +62,6 @@ std::string trim(const std::string& s);
 
 void setLogPath(const std::string& p);
 void log(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+void flushLog();  // vuelca el registro pendiente a la SD
 
 }  // namespace util

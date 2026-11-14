@@ -415,6 +415,28 @@ void setLogPath(const std::string& p) {
     if (stat(p.c_str(), &st) == 0 && st.st_size > 256 * 1024) remove(p.c_str());
 }
 
+// El registro se guarda en memoria y se vuelca a la SD en bloques (abrir/cerrar el archivo por cada línea
+// cuesta varias llamadas al sistema de archivos y frenaba a los hilos de red).
+static std::string g_logBuf;
+static uint64_t g_logFlushedAt = 0;
+
+static void flushLogLocked() {
+    if (!g_logBuf.empty() && !g_logPath.empty()) {
+        FILE* f = fopen(g_logPath.c_str(), "a");
+        if (f) {
+            fwrite(g_logBuf.data(), 1, g_logBuf.size(), f);
+            fclose(f);
+        }
+    }
+    g_logBuf.clear();
+    g_logFlushedAt = sys::nowMs();
+}
+
+void flushLog() {
+    sys::Lock l(g_logMx);
+    flushLogLocked();
+}
+
 void log(const char* fmt, ...) {
     char buf[1024];
     va_list ap;
@@ -423,10 +445,13 @@ void log(const char* fmt, ...) {
     va_end(ap);
     sys::Lock l(g_logMx);
     if (g_logPath.empty()) return;
-    FILE* f = fopen(g_logPath.c_str(), "a");
-    if (!f) return;
-    fprintf(f, "[%llu] %s\n", (unsigned long long)(sys::nowMs() / 1000), buf);
-    fclose(f);
+    char head[40];
+    snprintf(head, sizeof head, "[%llu] ", (unsigned long long)(sys::nowMs() / 1000));
+    g_logBuf += head;
+    g_logBuf += buf;
+    g_logBuf += '\n';
+    const uint64_t now = sys::nowMs();
+    if (g_logBuf.size() > 4096 || now - g_logFlushedAt > 3000) flushLogLocked();
 }
 
 }  // namespace util
