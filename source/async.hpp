@@ -20,8 +20,14 @@ public:
             ready_ = false;
         }
         busy = true;
-        th_.start([this, fn]() {
-            T r = fn();
+        const bool started = th_.start([this, fn]() {
+            T r{};
+            // Una excepción (sin memoria, JSON raro...) no debe tumbar la app ni dejar la tarea "en curso" para siempre.
+            try {
+                r = fn();
+            } catch (...) {
+                sys::noteFault();
+            }
             {
                 sys::Lock l(mx_);
                 res_ = std::move(r);
@@ -29,6 +35,13 @@ public:
             }
             busy = false;
         });
+        if (!started) {  // no se pudo crear el hilo: se entrega un resultado vacío en vez de quedarse esperando
+            sys::noteFault();
+            sys::Lock l(mx_);
+            res_ = T{};
+            ready_ = true;
+            busy = false;
+        }
     }
 
     bool take(T& out) {

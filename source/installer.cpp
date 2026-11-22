@@ -44,7 +44,7 @@ bool extractArchive(const std::string& archivePath, const std::string& destDir, 
     struct archive* a = archive_read_new();
     archive_read_support_filter_all(a);
     archive_read_support_format_all(a);
-    if (archive_read_open_filename(a, archivePath.c_str(), 1 << 16) != ARCHIVE_OK) {
+    if (archive_read_open_filename(a, archivePath.c_str(), 1 << 20) != ARCHIVE_OK) {
         const char* m = archive_error_string(a);
         err = std::string(T("No se pudo abrir el archivo: ", "Could not open archive: ")) + (m ? m : "?");
         archive_read_free(a);
@@ -55,11 +55,15 @@ bool extractArchive(const std::string& archivePath, const std::string& destDir, 
         progress->total = util::fileSize(archivePath);
         progress->now = 0;
     }
-    std::vector<char> buf(1 << 16);
+    std::vector<char> buf(1 << 18);
+    std::vector<char> wbuf(1 << 17);  // búfer de escritura propio: menos llamadas a la SD
     struct archive_entry* e = nullptr;
     int r;
     bool ok = true;
     int files = 0;
+    // Protección contra archivos "bomba" o SD casi llena: se corta si lo que va a descomprimirse no cabe.
+    const uint64_t freeB = util::freeSpace(destDir + "/");
+    uint64_t unpacked = 0;
     while ((r = archive_read_next_header(a, &e)) == ARCHIVE_OK || r == ARCHIVE_WARN) {
         if (progress && progress->cancel.load()) {
             err = T("Cancelado", "Cancelled");
@@ -81,6 +85,12 @@ bool extractArchive(const std::string& archivePath, const std::string& destDir, 
             archive_read_data_skip(a);
             continue;
         }
+        if (archive_entry_size_is_set(e)) unpacked += (uint64_t)std::max<int64_t>(0, archive_entry_size(e));
+        if ((freeB && unpacked + (32u << 20) > freeB) || files > 200000) {
+            err = T("No hay espacio suficiente en la SD para descomprimir este archivo", "Not enough free space on the SD card to unpack this archive");
+            ok = false;
+            break;
+        }
         util::mkdirs(util::dirName(out));
         FILE* f = fopen(out.c_str(), "wb");
         if (!f) {
@@ -88,6 +98,7 @@ bool extractArchive(const std::string& archivePath, const std::string& destDir, 
             ok = false;
             break;
         }
+        setvbuf(f, wbuf.data(), _IOFBF, wbuf.size());
         ssize_t n;
         while ((n = archive_read_data(a, buf.data(), buf.size())) > 0) {
             if (fwrite(buf.data(), 1, (size_t)n, f) != (size_t)n) {

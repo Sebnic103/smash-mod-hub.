@@ -1,5 +1,7 @@
 #include "app.hpp"
 
+#include <ctime>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -12,7 +14,7 @@
 #include "util.hpp"
 
 #ifndef APP_VERSION_STR
-#define APP_VERSION_STR "1.1.0"
+#define APP_VERSION_STR "1.2.0"
 #endif
 
 namespace col = ui::col;
@@ -88,6 +90,24 @@ std::string stem(const std::string& file) {
     return (d == std::string::npos || d == 0) ? file : file.substr(0, d);
 }
 
+std::string reslotProblemText(reslot::Problem p) {
+    switch (p) {
+        case reslot::Problem::NotFound: return S("No se encontró la carpeta del mod.", "The mod folder was not found.");
+        case reslot::Problem::HasConfig: return S("Este mod trae un config.json con rutas de slot (slots extra o archivos compartidos). Reslotearlo desde aquí podría romperlo, así que no se toca.", "This mod ships a config.json with slot paths (extra slots or shared files). Reslotting it here could break it, so it is left alone.");
+        case reslot::Problem::ExtraSlots: return S("Este mod usa slots a partir de c08 (slots extra), que necesitan configuración especial. No se puede reslotear desde aquí.", "This mod uses slots c08 and above (extra slots), which need special configuration. It cannot be reslotted here.");
+        case reslot::Problem::NoSlots: return S("No se encontró ningún slot (cNN) en este mod: no es un mod de personaje o no hay nada que cambiar.", "No slot (cNN) was found in this mod: it is not a fighter mod or there is nothing to change.");
+        case reslot::Problem::BadMap: return S("El nuevo slot choca con otro archivo del mod. Elige otro destino.", "The new slot clashes with another file in the mod. Pick a different target.");
+        case reslot::Problem::Io: return S("Error al renombrar archivos.", "Error renaming files.");
+        default: return "";
+    }
+}
+
+std::string slotName(int s) {
+    char b[8];
+    snprintf(b, sizeof b, "c%02d", s);
+    return b;
+}
+
 bool isArchiveName(const std::string& n) {
     std::string l = util::lower(n);
     for (const char* e : {".zip", ".7z", ".rar", ".tar", ".tar.gz", ".tgz", ".tar.xz", ".tar.bz2"})
@@ -112,6 +132,12 @@ bool App::init(SDL_Renderer* r) {
 
     g_settings.load();
     gb::setGameId(g_settings.gameId);
+    gb::loadCategoryCache();
+    {  // un reslot interrumpido (apagón, cierre forzado): se termina antes de leer los mods
+        std::string rerr;
+        const int resumed = reslot::recover(util::join(paths::data(), "reslot_journal.json"), rerr);
+        if (resumed != 0) util::log("reslot: recuperación -> %d operaciones (%s)", resumed, rerr.c_str());
+    }
     http::init("romfs:/cacert.pem");
     img_.init(r, paths::cache());
     store_.load();
@@ -126,6 +152,7 @@ bool App::init(SDL_Renderer* r) {
 void App::shutdown() {
     bgCancel_ = true;
     confCancel_ = true;
+    rsCancel_ = true;
     http::abortAll();  // corta ya las peticiones en curso: salir no debe esperar a la red
     dl_.stop();
     spaceJob_.join();
@@ -135,6 +162,9 @@ void App::shutdown() {
     updPrep_.join();
     sizeJob_.join();
     confJob_.join();
+    catJob_.join();
+    rsAnalyze_.join();
+    rsApply_.join();
     img_.shutdown();
     store_.save();
     http::shutdown();
@@ -284,6 +314,57 @@ void App::pollAsync() {
         }
     }
 
+    CatRes cres;
+    if (catJob_.take(cres) && cp_.open && cres.token == cp_.token) {
+        cp_.loading = false;
+        if (!cres.list.ok) {
+            cp_.err = cres.list.err;
+            if (cres.drill) toast(S("No se pudieron cargar las subcategorías: ", "Could not load subcategories: ") + cres.list.err + S("   (X: filtrar por ella)", "   (X: filter by it)"), col::bad);
+        } else if (cres.drill && cres.list.cats.empty()) {  // sin subcategorías: se filtra por ella
+            applyCategory(cres.target.id, catPathName(&cres.target));
+        } else {
+            CatLevel lv;
+            lv.id = cres.parent;
+            lv.name = cres.target.name;
+            lv.cats = std::move(cres.list.cats);
+            lv.learned = cres.list.learned;
+            lv.stale = cres.list.stale;
+            cp_.levels.push_back(std::move(lv));
+            cp_.filter.clear();
+            cp_.sel = 0;
+            rebuildShown();
+        }
+    }
+    if (cp_.open && cp_.pendingRoot && !catJob_.busy.load()) {
+        cp_.pendingRoot = false;
+        requestCats(nullptr);
+    }
+
+    ReslotAnalysisRes rar;
+    if (rsAnalyze_.take(rar) && rs_.open && rs_.folder == rar.folder) {
+        rs_.analyzing = false;
+        rs_.an = rar.an;
+        rs_.others = std::move(rar.others);
+        if (rs_.an.ok()) {
+            rs_.src = rs_.an.slots;
+            rs_.dst = rs_.src;
+            rs_.sel = 0;
+        }
+    }
+    ReslotApplyRes rap;
+    if (rsApply_.take(rap)) {
+        rs_.applying = false;
+        rs_.open = false;
+        switch (rap.p) {
+            case reslot::Problem::None:
+                toast(S("Reslot terminado (", "Reslot done (") + std::to_string(rap.items) + S(" elementos). Reinicia el juego para aplicarlo", " items). Restart the game to apply it"), col::good);
+                break;
+            case reslot::Problem::Cancelled: toast(S("Reslot cancelado: no se cambió nada", "Reslot cancelled: nothing was changed"), col::dim); break;
+            case reslot::Problem::Io: notice(S("Error al reslotear", "Reslot error"), rap.err + S("\nSe deshizo todo: el mod está como estaba.", "\nEverything was undone: the mod is as it was.")); break;
+            default: notice(S("No se pudo reslotear", "Could not reslot"), reslotProblemText(rap.p)); break;
+        }
+    }
+
     if (sizesDirty_ && tab_ == TAB_INSTALLED) startSizeScan();
 }
 
@@ -415,7 +496,7 @@ void App::queueDownload(const gb::Item& item, const gb::File& f) {
 // ============================================================================ explorar
 
 std::string App::pageKey(int page) const {
-    return std::to_string(g_settings.gameId) + "|" + std::to_string(g_settings.perPage) + "|" + (query_.empty() ? std::string(gb::sortKey(sort_)) : "q:" + query_) + "|" + std::to_string(page);
+    return std::to_string(g_settings.gameId) + "|" + std::to_string(g_settings.perPage) + "|" + (query_.empty() ? std::string(gb::sortKey(sort_)) : "q:" + query_) + "|c" + std::to_string(catId_) + "|" + std::to_string(page);
 }
 
 void App::rememberPage(const std::string& key, const gb::Page& pg) {
@@ -459,7 +540,11 @@ void App::startPageJob() {
     gb::Sort s = sort_;
     int p = desiredPage_;
     int per = g_settings.perPage;
-    pageJob_.run([q, s, p, per]() { return q.empty() ? gb::browse(p, s, per) : gb::search(q, p, per); });
+    const int64_t cat = catId_;
+    pageJob_.run([q, s, p, per, cat]() {
+        if (q.empty()) return cat > 0 ? gb::browseCategory(cat, p, s, per) : gb::browse(p, s, per);
+        return cat > 0 ? gb::searchInCategory(cat, q) : gb::search(q, p, per);
+    });
 }
 
 bool App::moveSel(int& sel, int count, int cols, const Input& in) {
@@ -511,8 +596,11 @@ void App::updateBrowse(const Input& in) {
             loadPage(1);
         }
     }
+    if (in.b) openCatPicker();
     if (in.minus) {
         query_.clear();
+        catId_ = 0;
+        catName_.clear();
         pageCache_.clear();  // "Inicio" también sirve para refrescar
         pageOrder_.clear();
         loadPage(1);
@@ -527,7 +615,8 @@ void App::drawBrowse() {
     const int areaY = HEAD + SUB, areaH = H - FOOT - areaY;
     ui::fill(0, HEAD, W, SUB, col::panel);
     std::string left = query_.empty() ? S("Orden: ", "Sort: ") + sortName(sort_) : S("Búsqueda: ", "Search: ") + "\"" + query_ + "\"";
-    ui::text(left, 30, HEAD + 6, ui::SMALL, col::text, 700);
+    if (catId_ > 0) left += "   -   " + S("Filtro: ", "Filter: ") + (catName_.empty() ? S("(categoría)", "(category)") : catName_);
+    ui::text(left, 30, HEAD + 6, ui::SMALL, catId_ > 0 ? col::accent : col::text, 700);
     const bool loadingNow = pageJob_.busy.load() || wantPending_;
     const int shownPage = loadingNow ? desiredPage_ : pageNo_;
     std::string right = S("Página ", "Page ") + std::to_string(shownPage);
@@ -537,6 +626,7 @@ void App::drawBrowse() {
         if (!loadingNow && pages >= pageNo_ && (int)page_.items.size() <= per && pages > 1) right += S(" de ", " of ") + std::to_string(pages);
     }
     if (!page_.items.empty()) right += "   -   " + std::to_string(page_.items.size()) + S(" mods", " mods");
+    if (page_.scanned > 0 && !loadingNow) right = S("Buscado en ", "Searched ") + std::to_string(page_.scanned) + S(" mods de la categoría", " mods in the category");
     ui::text(right, W - 530, HEAD + 6, ui::SMALL, col::dim, 500, 2);
 
     bool busy = loadingNow;
@@ -546,7 +636,7 @@ void App::drawBrowse() {
         } else if (!pageErr_.empty()) {
             drawCenterMessage(S("No se pudo conectar", "Could not connect"), pageErr_ + "   -   " + S("A: reintentar", "A: retry"), col::bad);
         } else {
-            std::string sub = page_.dropped > 0 ? S("Se descartaron resultados de otro juego: revisa el ID de juego en Herramientas", "Results from another game were dropped: check the game ID in Tools") : S("Prueba otra búsqueda o pulsa - para volver al inicio", "Try another search or press - to go back");
+            std::string sub = page_.dropped > 0 ? S("Se descartaron resultados de otro juego: revisa el ID de juego en Herramientas", "Results from another game were dropped: check the game ID in Tools") : S("Prueba otra búsqueda, otro filtro (B) o pulsa - para volver al inicio", "Try another search, another filter (B) or press - to go back");
             drawCenterMessage(S("Sin resultados", "No results"), sub, col::dim);
         }
         return;
@@ -578,6 +668,157 @@ void App::drawBrowse() {
     ui::unclip();
     ui::scrollbar(W - 14, areaY + 10, areaH - 20, areaH - 10, ((int)page_.items.size() + COLS - 1) / COLS * pitch, (int)browseScroll_.cur);
     if (busy) ui::text(S("Cargando", "Loading") + std::string((size_t)((now_ / 350) % 4), '.'), W - 230, HEAD + 6, ui::SMALL, col::accent, 200, 2);
+}
+
+// ============================================================================ filtros por categoría
+
+std::string App::catPathName(const gb::Category* extra) const {
+    std::string n;
+    for (size_t i = 1; i < cp_.levels.size(); i++) n += (n.empty() ? "" : " / ") + cp_.levels[i].name;
+    if (extra) n += (n.empty() ? "" : " / ") + extra->name;
+    return n;
+}
+
+void App::openCatPicker() {
+    cp_ = CatPicker();
+    cp_.open = true;
+    cp_.token = ++catToken_;
+    if (catJob_.busy.load()) {  // todavía acaba una petición anterior: la raíz se pide en cuanto termine
+        cp_.loading = true;
+        cp_.pendingRoot = true;
+        return;
+    }
+    requestCats(nullptr);
+}
+
+void App::requestCats(const gb::Category* target) {
+    if (catJob_.busy.load()) {
+        toast(S("Espera un momento...", "Wait a moment..."), col::dim);
+        return;
+    }
+    cp_.loading = true;
+    cp_.err.clear();
+    const int64_t parent = target ? target->id : 0;
+    const bool drill = target != nullptr;
+    const gb::Category t = target ? *target : gb::Category();
+    const int token = cp_.token;
+    catJob_.run([parent, drill, t, token]() {
+        CatRes r;
+        r.parent = parent;
+        r.drill = drill;
+        r.target = t;
+        r.token = token;
+        r.list = gb::categories(parent);
+        return r;
+    });
+}
+
+void App::rebuildShown() {
+    cp_.shown.clear();
+    if (cp_.levels.empty()) return;
+    const auto& cats = cp_.levels.back().cats;
+    const std::string f = util::lower(cp_.filter);
+    for (size_t i = 0; i < cats.size(); i++)
+        if (f.empty() || util::lower(cats[i].name).find(f) != std::string::npos) cp_.shown.push_back((int)i);
+    if (cp_.sel > (int)cp_.shown.size()) cp_.sel = (int)cp_.shown.size();
+}
+
+void App::applyCategory(int64_t id, const std::string& name) {
+    cp_.open = false;
+    cp_.token = ++catToken_;  // cualquier respuesta pendiente del selector se descarta
+    catId_ = id > 0 ? id : 0;
+    catName_ = catId_ ? name : std::string();
+    loadPage(1);
+}
+
+namespace {
+constexpr int kCatRows = 14, kCatRowH = 36;
+}
+
+void App::updateCatPicker(const Input& in) {
+    if (in.b) {
+        if (!cp_.loading && cp_.levels.size() > 1) {  // un nivel atrás
+            cp_.levels.pop_back();
+            cp_.filter.clear();
+            cp_.err.clear();
+            cp_.sel = 0;
+            rebuildShown();
+        } else {
+            cp_.open = false;
+            cp_.token = ++catToken_;
+        }
+        return;
+    }
+    if (cp_.loading) return;  // esperando a GameBanana
+    if (cp_.levels.empty()) {  // la raíz falló: A reintenta
+        if (in.a) requestCats(nullptr);
+        return;
+    }
+    const int n = 1 + (int)cp_.shown.size();
+    moveSel(cp_.sel, n, 1, in);
+    if (in.zl) cp_.sel = std::max(0, cp_.sel - kCatRows);
+    if (in.zr) cp_.sel = std::min(n - 1, cp_.sel + kCatRows);
+    if (in.y) {
+        std::string out;
+        if (platform::textInput(S("Buscar en la lista de categorías", "Search the category list"), cp_.filter, out, 40)) {
+            cp_.filter = util::trim(out);
+            cp_.sel = 0;
+            rebuildShown();
+        }
+        return;
+    }
+    if (!(in.a || in.x)) return;
+    const CatLevel& lv = cp_.levels.back();
+    if (cp_.sel == 0) {  // fila especial: quitar el filtro (raíz) o filtrar por todo lo de esta categoría
+        if (lv.id == 0) applyCategory(0, "");
+        else applyCategory(lv.id, catPathName(nullptr));
+        return;
+    }
+    const gb::Category c = lv.cats[(size_t)cp_.shown[(size_t)cp_.sel - 1]];
+    if (in.x) applyCategory(c.id, catPathName(&c));  // X: filtrar ya, sin abrir sus subcategorías
+    else requestCats(&c);                            // A: abrir (si no tiene subcategorías, filtra)
+}
+
+void App::drawCatPicker() {
+    ui::fill(0, 0, W, H, ui::Color(0, 0, 0, 200));
+    const int x = 50, y = 30, w = W - 100, h = H - 60;
+    ui::fill(x, y, w, h, col::panel);
+    ui::outline(x, y, w, h, col::accent, 3);
+    std::string title = S("Filtrar por categoría", "Filter by category");
+    const std::string path = catPathName(nullptr);
+    if (!path.empty()) title += ":  " + path;
+    ui::text(title, x + 24, y + 14, ui::BIG, col::text, w - 48);
+    const int ay = y + 70;
+    if (cp_.levels.empty()) {
+        if (cp_.loading) ui::text(S("Cargando categorías", "Loading categories") + std::string((size_t)((now_ / 350) % 4), '.'), x, ay + 160, ui::NORMAL, col::text, w, 1);
+        else ui::text(S("No se pudieron cargar las categorías: ", "Could not load categories: ") + cp_.err + "   -   " + S("A: reintentar", "A: retry"), x + 30, ay + 160, ui::NORMAL, col::bad, w - 60, 1);
+    } else {
+        const CatLevel& lv = cp_.levels.back();
+        std::string note;
+        if (lv.learned) note = S("Lista parcial: solo categorías vistas en los mods ya cargados", "Partial list: only categories seen in the mods already loaded");
+        else if (lv.stale) note = S("Sin conexión: lista guardada de la última vez", "Offline: list saved from last time");
+        if (!cp_.filter.empty()) note += (note.empty() ? "" : "   -   ") + S("Texto: \"", "Text: \"") + cp_.filter + "\"";
+        if (!note.empty()) ui::text(note, x + 24, y + 52, ui::SMALL, col::warn, w - 48);
+        const int n = 1 + (int)cp_.shown.size();
+        const int first = std::max(0, std::min(cp_.sel - kCatRows / 2, n - kCatRows));
+        for (int i = first; i < std::min(n, first + kCatRows); i++) {
+            const int ry = ay + (i - first) * kCatRowH;
+            const bool sel = i == cp_.sel;
+            ui::fill(x + 20, ry, w - 60, kCatRowH - 4, sel ? col::panelHi : col::bg);
+            if (sel) ui::outline(x + 20, ry, w - 60, kCatRowH - 4, col::accent, 2);
+            if (i == 0) {
+                ui::text(lv.id == 0 ? S("Todas las categorías (quitar filtro)", "All categories (remove filter)") : S("Todo en ", "Everything in ") + lv.name, x + 36, ry + 3, ui::NORMAL, col::accent, w - 120);
+            } else {
+                const gb::Category& c = lv.cats[(size_t)cp_.shown[(size_t)i - 1]];
+                ui::text(c.name, x + 36, ry + 3, ui::NORMAL, col::text, w - 300);
+                if (c.count >= 0) ui::text(count(c.count), x + w - 220, ry + 3, ui::NORMAL, col::dim, 160, 2);
+            }
+        }
+        if (cp_.shown.empty() && !cp_.filter.empty()) ui::text(S("Sin coincidencias", "No matches"), x, ay + 60, ui::NORMAL, col::dim, w, 1);
+        ui::scrollbar(x + w - 28, ay, kCatRows * kCatRowH, kCatRows * kCatRowH, n * kCatRowH, first * kCatRowH);
+        if (cp_.loading) ui::text(S("Cargando", "Loading") + std::string((size_t)((now_ / 350) % 4), '.'), x + w - 260, y + 18, ui::NORMAL, col::accent, 220, 2);
+    }
+    ui::text(S("A Abrir   X Filtrar aquí   Y Buscar en la lista   B Atrás   ZL/ZR Saltar", "A Open   X Filter here   Y Search list   B Back   ZL/ZR Jump"), x, y + h - 40, ui::SMALL, col::dim, w, 1);
 }
 
 // ============================================================================ detalle
@@ -752,6 +993,7 @@ void App::updateInstalled(const Input& in) {
             }
         });
     }
+    if (in.b) openReslot((size_t)instSel_);
     if (in.y) {
         if (m.hasUpdate()) startModUpdate((size_t)instSel_);
         else if (m.meta.gbId) openDetail(itemFromMod(m));
@@ -798,6 +1040,177 @@ void App::drawInstalled() {
     }
     ui::unclip();
     ui::scrollbar(W - 14, areaY + 10, areaH - 20, areaH - 10, ((int)mods.size() + COLS - 1) / COLS * pitch, (int)instScroll_.cur);
+}
+
+// ============================================================================ reslotter
+
+void App::openReslot(size_t idx) {
+    if (idx >= store_.mods().size() || rsAnalyze_.busy.load() || rsApply_.busy.load()) return;
+    if (dl_.activeCount() > 0) {
+        toast(S("Espera a que terminen las descargas para reslotear", "Wait for the downloads to finish before reslotting"), col::warn);
+        return;
+    }
+    const Mod& m = store_.mods()[idx];
+    rs_ = ReslotUi();
+    rs_.open = true;
+    rs_.analyzing = true;
+    rs_.folder = m.folder;
+    rs_.title = m.title();
+    rs_.dir = m.dir();
+    std::vector<std::pair<std::string, std::string>> others;  // (título, carpeta) de los demás mods activados
+    for (const auto& o : store_.mods())
+        if (o.enabled && o.folder != m.folder) others.emplace_back(o.title(), o.dir());
+    const std::string folder = m.folder, dir = m.dir();
+    rsAnalyze_.run([this, folder, dir, others]() {
+        ReslotAnalysisRes r;
+        r.folder = folder;
+        r.an = reslot::analyze(dir, &bgCancel_);
+        if (r.an.ok()) {
+            for (const auto& o : others) {
+                if (bgCancel_.load()) break;
+                ReslotOther ro;
+                ro.title = o.first;
+                ro.use = reslot::fighterSlots(o.second);
+                if (!ro.use.empty()) r.others.push_back(std::move(ro));
+            }
+        }
+        return r;
+    });
+}
+
+bool App::reslotValid() const {
+    std::vector<int> seen;
+    bool changed = false;
+    for (size_t i = 0; i < rs_.dst.size(); i++) {
+        if (rs_.dst[i] < 0 || rs_.dst[i] > reslot::kMaxSlot) return false;
+        if (std::find(seen.begin(), seen.end(), rs_.dst[i]) != seen.end()) return false;
+        seen.push_back(rs_.dst[i]);
+        changed = changed || rs_.dst[i] != rs_.src[i];
+    }
+    return changed;
+}
+
+// Otros mods activados que ya usan el personaje y el slot al que se va a mover este.
+std::vector<std::string> App::reslotWarnings() const {
+    std::vector<std::string> out;
+    for (size_t i = 0; i < rs_.src.size() && i < rs_.dst.size(); i++) {
+        if (rs_.dst[i] == rs_.src[i]) continue;
+        for (const auto& f : rs_.an.perFighter) {
+            if (std::find(f.second.begin(), f.second.end(), rs_.src[i]) == f.second.end()) continue;
+            for (const auto& o : rs_.others) {
+                auto it = o.use.find(f.first);
+                if (it == o.use.end() || std::find(it->second.begin(), it->second.end(), rs_.dst[i]) == it->second.end()) continue;
+                const std::string w = "\"" + o.title + S("\" ya usa ", "\" already uses ") + f.first + " " + slotName(rs_.dst[i]);
+                if (std::find(out.begin(), out.end(), w) == out.end()) out.push_back(w);
+            }
+        }
+    }
+    return out;
+}
+
+void App::startReslot() {
+    if (!reslotValid()) {
+        toast(S("Elige slots distintos y cambia al menos uno", "Pick different slots and change at least one"), col::warn);
+        return;
+    }
+    reslot::SlotMap map;
+    std::string summary;
+    for (size_t i = 0; i < rs_.src.size(); i++) {
+        if (rs_.src[i] == rs_.dst[i]) continue;
+        map[rs_.src[i]] = rs_.dst[i];
+        summary += (summary.empty() ? "" : ",  ") + slotName(rs_.src[i]) + " -> " + slotName(rs_.dst[i]);
+    }
+    std::string msg = summary + "\n" + std::to_string(rs_.an.items) + S(" elementos llevan el slot en el nombre.", " items carry the slot in their name.");
+    const auto warns = reslotWarnings();
+    if (!warns.empty()) msg += "\n" + S("Aviso: ", "Warning: ") + warns[0] + (warns.size() > 1 ? "  (+" + std::to_string(warns.size() - 1) + ")" : "");
+    const std::string dir = rs_.dir, folder = rs_.folder;
+    const std::string journal = util::join(paths::data(), "reslot_journal.json");
+    confirm(S("Reslottear \"", "Reslot \"") + rs_.title + "\"", msg, [this, map, dir, folder, journal]() {
+        rsCancel_ = false;
+        rsDone_ = 0;
+        rsTotal_ = 0;
+        rs_.applying = true;
+        rsApply_.run([this, map, dir, folder, journal]() {
+            ReslotApplyRes r;
+            r.folder = folder;
+            reslot::Plan plan;
+            r.p = reslot::makePlan(dir, map, plan);
+            if (r.p == reslot::Problem::None) {
+                r.items = plan.items;
+                rsTotal_ = (int)plan.ops.size();
+                r.p = reslot::apply(plan, journal, &rsDone_, &rsCancel_, r.err);
+            }
+            return r;
+        });
+    });
+}
+
+void App::updateReslot(const Input& in) {
+    if (in.b || (!rs_.analyzing && !rs_.an.ok() && in.a)) {
+        rs_.open = false;
+        return;
+    }
+    if (rs_.analyzing || !rs_.an.ok() || rs_.src.empty()) return;
+    moveSel(rs_.sel, (int)rs_.src.size(), 1, in);
+    int& d = rs_.dst[(size_t)rs_.sel];
+    if (in.left && d > 0) d--;
+    if (in.right && d < reslot::kMaxSlot) d++;
+    if (in.x) rs_.dst = rs_.src;
+    if (in.a) startReslot();
+}
+
+void App::drawReslot() {
+    ui::fill(0, 0, W, H, ui::Color(0, 0, 0, 200));
+    const int x = 50, y = 30, w = W - 100, h = H - 60;
+    ui::fill(x, y, w, h, col::panel);
+    ui::outline(x, y, w, h, col::accent, 3);
+    ui::text(S("Reslottear: ", "Reslot: ") + rs_.title, x + 24, y + 14, ui::BIG, col::text, w - 48);
+    int cy = y + 70;
+    if (rs_.analyzing) {
+        ui::text(S("Analizando el mod", "Analysing the mod") + std::string((size_t)((now_ / 350) % 4), '.'), x, cy + 150, ui::NORMAL, col::text, w, 1);
+        ui::text(S("B  Cancelar", "B  Cancel"), x, y + h - 40, ui::SMALL, col::dim, w, 1);
+        return;
+    }
+    if (!rs_.an.ok()) {
+        ui::textWrapped(reslotProblemText(rs_.an.problem), x + 30, cy + 40, w - 60, ui::NORMAL, col::warn, 0, 300);
+        ui::text(S("A / B  Cerrar", "A / B  Close"), x, y + h - 40, ui::SMALL, col::dim, w, 1);
+        return;
+    }
+    std::string fighters;
+    for (const auto& f : rs_.an.perFighter) fighters += (fighters.empty() ? "" : ", ") + f.first;
+    ui::text(S("Personaje(s): ", "Fighter(s): ") + fighters, x + 30, cy, ui::NORMAL, col::text, w - 60);
+    cy += 30;
+    ui::text(std::to_string(rs_.an.items) + S(" elementos llevan el slot en el nombre (modelos, efectos, sonidos, retratos...)", " items carry the slot in their name (models, effects, sounds, portraits...)"), x + 30, cy, ui::SMALL, col::dim, w - 60);
+    cy += 34;
+    ui::text(S("Elige el slot nuevo de cada uno:", "Pick the new slot for each one:"), x + 30, cy, ui::NORMAL, col::accent, w - 60);
+    cy += 36;
+    // un slot destino no puede repetirse
+    std::vector<int> useCount(8, 0);
+    for (int dv : rs_.dst)
+        if (dv >= 0 && dv <= reslot::kMaxSlot) useCount[(size_t)dv]++;
+    for (size_t i = 0; i < rs_.src.size(); i++) {
+        const int ry = cy + (int)i * 40;
+        const bool sel = (int)i == rs_.sel;
+        ui::fill(x + 30, ry, 560, 36, sel ? col::panelHi : col::bg);
+        if (sel) ui::outline(x + 30, ry, 560, 36, col::accent, 2);
+        const bool dup = rs_.dst[i] >= 0 && rs_.dst[i] <= reslot::kMaxSlot && useCount[(size_t)rs_.dst[i]] > 1;
+        const bool changed = rs_.dst[i] != rs_.src[i];
+        ui::text(slotName(rs_.src[i]), x + 50, ry + 4, ui::NORMAL, col::text, 90);
+        ui::text("->", x + 150, ry + 4, ui::NORMAL, col::dim, 50);
+        ui::text((sel ? "<  " : "   ") + slotName(rs_.dst[i]) + (sel ? "  >" : ""), x + 215, ry + 4, ui::NORMAL, dup ? col::bad : (changed ? col::good : col::dim), 160);
+        ui::text(dup ? S("repetido", "duplicate") : (changed ? S("cambia", "changes") : S("sin cambios", "unchanged")), x + 420, ry + 4, ui::SMALL, dup ? col::bad : col::dim, 160);
+    }
+    int wy = cy + (int)rs_.src.size() * 40 + 8;
+    const auto warns = reslotWarnings();
+    for (size_t i = 0; i < warns.size() && i < 3; i++) {
+        ui::text(S("Aviso: ", "Warning: ") + warns[i] + S("  (usa Herramientas > conflictos)", "  (see Tools > conflicts)"), x + 30, wy, ui::SMALL, col::warn, w - 60);
+        wy += 24;
+    }
+    if (!rs_.an.unknown.empty()) {
+        std::string u = S("Se dejan sin cambiar ", "Left unchanged: ") + std::to_string(rs_.an.unknown.size()) + S(" ruta(s) que no se reconocen: ", " path(s) not recognised: ") + rs_.an.unknown[0];
+        ui::text(u, x + 30, wy, ui::SMALL, col::dim, w - 60);
+    }
+    ui::text(S("Arriba/Abajo Slot   Izq/Der Nuevo slot   X Restablecer   A Aplicar   B Cerrar", "Up/Down Slot   Left/Right New slot   X Reset   A Apply   B Close"), x, y + h - 40, ui::SMALL, col::dim, w, 1);
 }
 
 // ============================================================================ descargas
@@ -934,14 +1347,15 @@ std::string App::toolLabel(int idx, std::string& value) const {
         case 7: value = g_settings.verifyMd5 ? S("Sí", "Yes") : "No"; return S("Verificar MD5 de las descargas", "Verify MD5 of downloads");
         case 8: value = g_settings.keepArchives ? S("Sí", "Yes") : "No"; return S("Conservar los archivos descargados", "Keep downloaded archives");
         case 9: value = std::to_string(g_settings.gameId); return S("ID del juego en GameBanana", "GameBanana game ID");
-        case 10: return S("Borrar caché de imágenes", "Clear image cache");
+        case 10: return S("Borrar caché de imágenes y categorías", "Clear image and category cache");
         case 11: return S("Diagnóstico y registro", "Diagnostics and log");
         case 12: value = std::to_string(g_settings.dlConns); return S("Conexiones por descarga (más = más rápido)", "Connections per download (more = faster)");
+        case 13: return S("Reslottear un mod (cambiar su slot c00-c07)", "Reslot a mod (change its c00-c07 slot)");
         default: return S("Salir", "Exit");
     }
 }
 
-static constexpr int kToolCount = 14;
+static constexpr int kToolCount = 15;
 
 void App::updateTools(const Input& in) {
     moveSel(toolSel_, kToolCount, 1, in);
@@ -996,6 +1410,8 @@ void App::activateTool(int idx) {
                     g_settings.gameId = id;
                     g_settings.save();
                     gb::setGameId(id);
+                    catId_ = 0;
+                    catName_.clear();
                     page_ = gb::Page();
                     pageLoaded_ = false;
                     loadPage(1);
@@ -1006,7 +1422,8 @@ void App::activateTool(int idx) {
         }
         case 10:
             img_.clearDisk();
-            toast(S("Caché de imágenes borrada", "Image cache cleared"), col::good);
+            gb::clearCategoryCache();
+            toast(S("Cachés de imágenes y categorías borradas", "Image and category caches cleared"), col::good);
             break;
         case 11: showDiagnostics(); break;
         case 12: {
@@ -1018,6 +1435,10 @@ void App::activateTool(int idx) {
             g_settings.save();
             break;
         }
+        case 13:
+            tab_ = TAB_INSTALLED;
+            toast(S("Elige un mod y pulsa B para reslotearlo", "Pick a mod and press B to reslot it"), col::accent);
+            break;
         default:
             if (dl_.activeCount() > 0) confirm(S("Salir", "Exit"), S("Hay descargas en curso. ¿Salir igualmente?", "Downloads are in progress. Exit anyway?"), [this]() { quit_ = true; });
             else quit_ = true;
@@ -1076,7 +1497,7 @@ void App::showDiagnostics() {
 }
 
 void App::drawTools() {
-    const int rowH = 42, top = HEAD + 8;
+    const int rowH = 38, top = HEAD + 8;
     for (int i = 0; i < kToolCount; i++) {
         std::string value;
         std::string label = toolLabel(i, value);
@@ -1164,8 +1585,8 @@ void App::drawMain() {
     drawHeader();
     std::string h;
     switch (tab_) {
-        case TAB_BROWSE: h = S("A Ver   Y Buscar   X Orden   ZL/ZR Página   - Inicio   L/R Pestañas   + Salir", "A View   Y Search   X Sort   ZL/ZR Page   - Home   L/R Tabs   + Exit"); break;
-        case TAB_INSTALLED: h = S("A Activar/Desactivar   X Borrar   Y Actualizar/Ver   - Buscar act.   ZL/ZR Todos off/on", "A Enable/Disable   X Delete   Y Update/View   - Check updates   ZL/ZR All off/on"); break;
+        case TAB_BROWSE: h = S("A Ver   Y Buscar   X Orden   B Filtros   ZL/ZR Pág.   - Inicio   L/R Pestañas   + Salir", "A View   Y Search   X Sort   B Filters   ZL/ZR Page   - Home   L/R Tabs   + Exit"); break;
+        case TAB_INSTALLED: h = S("A On/Off   X Borrar   Y Actualizar/Ver   B Reslot   - Buscar act.   ZL/ZR Todos off/on", "A On/Off   X Delete   Y Update/View   B Reslot   - Check updates   ZL/ZR All off/on"); break;
         case TAB_DOWNLOADS: h = S("A Reintentar   X Cancelar/Quitar   Y Limpiar terminadas", "A Retry   X Cancel/Remove   Y Clear finished"); break;
         case TAB_PROFILES: h = S("A Aplicar   X Borrar   Y Nuevo (guarda los activados)", "A Apply   X Delete   Y New (saves enabled mods)"); break;
         default: h = S("A Seleccionar / cambiar   L/R Pestañas   + Salir", "A Select / change   L/R Tabs   + Exit"); break;
@@ -1271,6 +1692,21 @@ void App::updateMain(const Input& in) {
 
 void App::frame(const Input& in) {
     now_ = sys::nowMs();
+    // Al despertar la consola tras suspenderla, las conexiones guardadas están muertas: se cierran para que la
+    // siguiente petición abra una nueva en vez de fallar. (El reloj de pared avanza durante la suspensión; el monotónico no.)
+    const int64_t wall = (int64_t)time(nullptr);
+    if (lastWall_ > 0 && lastMono_ > 0 && wall - lastWall_ - (int64_t)((now_ - lastMono_) / 1000) >= 5) {
+        util::log("reanudado tras suspensión: se cierran las conexiones guardadas");
+        http::dropIdle();
+        lastStatus_ = 0;
+    }
+    lastWall_ = wall;
+    lastMono_ = now_;
+    platform::cpuBoost(dl_.activeCount() > 0);  // CPU a tope solo mientras se descarga/instala
+    if (sys::faultCount() != lastFaults_) {
+        util::log("excepciones atrapadas en hilos de fondo: %d", sys::faultCount());
+        lastFaults_ = sys::faultCount();
+    }
     if (now_ - lastStatus_ > 15000) refreshStatus();
     if (!autoUpdChecked_ && now_ - startedAt_ > 6000 && pageLoaded_) {
         autoUpdChecked_ = true;
@@ -1287,7 +1723,11 @@ void App::frame(const Input& in) {
     else if (view_.open) updateView(in);
     else if (confJob_.busy.load()) {
         if (in.b) confCancel_ = true;
-    } else if (detailOpen_) updateDetail(in);
+    } else if (rs_.applying) {
+        if (in.b) rsCancel_ = true;
+    } else if (rs_.open) updateReslot(in);
+    else if (cp_.open) updateCatPicker(in);
+    else if (detailOpen_) updateDetail(in);
     else updateMain(in);
 
     SDL_SetRenderDrawColor(ren_, col::bg.r, col::bg.g, col::bg.b, 255);
@@ -1295,8 +1735,17 @@ void App::frame(const Input& in) {
     if (detailOpen_) drawDetail();
     else drawMain();
     if (confJob_.busy.load()) drawBusyOverlay(S("Buscando conflictos... ", "Scanning for conflicts... ") + std::to_string(confDone_.load()) + "/" + std::to_string(confTotal_), confTotal_ ? (double)confDone_.load() / confTotal_ : 0.0);
+    if (cp_.open) drawCatPicker();
+    if (rs_.open) drawReslot();
+    if (rs_.applying) drawBusyOverlay(S("Reslot en curso... ", "Reslotting... ") + std::to_string(rsDone_.load()) + "/" + std::to_string(rsTotal_.load()), rsTotal_.load() ? (double)rsDone_.load() / rsTotal_.load() : 0.0);
     if (view_.open) drawView();
     drawToast();
     if (dialog_.open) drawDialog();
     ui::endFrame();
+    // Diagnóstico: un fotograma muy lento se anota en el registro para poder localizar congelaciones.
+    const uint64_t dt = sys::nowMs() - now_;
+    if (dt > 150 && now_ - lastSlowLog_ > 4000) {
+        lastSlowLog_ = now_;
+        util::log("fotograma lento: %llu ms (pestaña %d, detalle %d, descargas %d)", (unsigned long long)dt, (int)tab_, detailOpen_ ? 1 : 0, dl_.activeCount());
+    }
 }

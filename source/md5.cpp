@@ -90,6 +90,14 @@ struct Ctx {
 
 }  // namespace
 
+struct Hasher::Impl {
+    Ctx c;
+};
+Hasher::Hasher() : p_(new Impl) {}
+Hasher::~Hasher() { delete p_; }
+void Hasher::update(const void* data, size_t n) { p_->c.update((const uint8_t*)data, n); }
+std::string Hasher::finish() { return p_->c.finish(); }
+
 std::string hex(const std::string& data) {
     Ctx c;
     c.update((const uint8_t*)data.data(), data.size());

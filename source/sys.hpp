@@ -47,6 +47,10 @@ void initThreads();
 // Hilo de fondo: en la Switch corre con prioridad MENOR que el hilo principal (la interfaz lo interrumpe
 // siempre) y, si hay otro núcleo libre, en ese núcleo. Así las descargas, el JSON, TLS o la decodificación
 // de imágenes no dejan la interfaz congelada.
+// Cuenta las excepciones que se atraparon en hilos de fondo (para el registro de diagnóstico).
+void noteFault();
+int faultCount();
+
 class Thread {
 public:
     Thread() = default;

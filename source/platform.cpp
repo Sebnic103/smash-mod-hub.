@@ -83,6 +83,17 @@ std::string firmwareVersion() {
     return out;
 }
 
+// Se enlaza por nombre de símbolo y como "débil": si la libnx instalada no tuviera la función, el programa sigue
+// compilando y simplemente no hace nada (nunca rompe la compilación ni el arranque).
+extern "C" u32 smh_cpuBoostMode(u32 mode) __asm__("appletSetCpuBoostMode") __attribute__((weak));
+
+void cpuBoost(bool on) {
+    static bool cur = false;
+    if (on == cur) return;
+    cur = on;
+    if (smh_cpuBoostMode) smh_cpuBoostMode(on ? 1u : 0u);  // 1 = FastLoad, 0 = desactivado; el resultado se ignora
+}
+
 bool textInput(const std::string& header, const std::string& initial, std::string& out, int maxLen, bool numeric) {
     SwkbdConfig kbd;
     if (R_FAILED(swkbdCreate(&kbd, 0))) return false;
@@ -109,6 +120,7 @@ void Pad::init() {}
 Input Pad::poll() { return Input(); }
 std::string firmwareVersion() { return ""; }
 bool textInput(const std::string&, const std::string&, std::string&, int, bool) { return false; }
+void cpuBoost(bool) {}
 
 #endif
 

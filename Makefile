@@ -26,7 +26,7 @@ ROMFS       := romfs
 
 APP_TITLE   := Smash Mod Hub
 APP_AUTHOR  := Smash Mod Hub
-APP_VERSION := 1.1.0
+APP_VERSION := 1.2.0
 ICON        := icon.jpg
 
 #---------------------------------------------------------------------------------

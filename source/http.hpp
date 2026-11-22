@@ -8,6 +8,7 @@ namespace http {
 struct Result {
     long status = 0;
     std::string error;  // vacío si la transferencia en sí fue bien
+    std::string md5;    // downloadBig: MD5 del archivo calculado durante la descarga ("" = no disponible)
     bool ok() const { return error.empty() && status >= 200 && status < 300; }
     std::string describe() const;
 };
@@ -20,6 +21,8 @@ bool tlsVerified();
 void trimIdle();
 // Al salir de la app: corta de inmediato todas las transferencias en curso (y las nuevas fallan rápido).
 void abortAll();
+// Cierra ya todas las conexiones guardadas (al volver de la suspensión los sockets viejos están muertos).
+void dropIdle();
 
 // GET a memoria (JSON, etc.)
 Result get(const std::string& url, std::string& body, Progress* progress = nullptr, long timeoutSec = 30);

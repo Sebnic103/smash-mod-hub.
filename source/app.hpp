@@ -14,6 +14,7 @@
 #include "imagecache.hpp"
 #include "input.hpp"
 #include "modstore.hpp"
+#include "reslot.hpp"
 #include "ui.hpp"
 
 class App {
@@ -40,6 +41,52 @@ private:
     };
     struct SizeRes {
         std::vector<std::pair<std::string, uint64_t>> sizes;  // (carpeta, bytes)
+    };
+    // --- filtros por categoría
+    struct CatRes {
+        int64_t parent = 0;
+        bool drill = false;  // se pidieron los hijos de "target" (el usuario pulsó A sobre ella)
+        gb::Category target;
+        gb::CategoryList list;
+        int token = 0;  // a qué apertura del selector pertenece (las respuestas viejas se descartan)
+    };
+    struct CatLevel {
+        int64_t id = 0;
+        std::string name;
+        std::vector<gb::Category> cats;
+        bool learned = false, stale = false;
+    };
+    struct CatPicker {
+        bool open = false, loading = false;
+        std::vector<CatLevel> levels;  // levels[0] = raíz
+        std::string filter, err;       // filtro de texto dentro de la lista / último error
+        std::vector<int> shown;        // posiciones de levels.back().cats que pasan el filtro
+        int sel = 0;                   // 0 = fila especial; 1.. = shown[sel - 1]
+        int token = 0;
+        bool pendingRoot = false;      // se abrió mientras aún corría una petición anterior
+    };
+    // --- reslotter
+    struct ReslotOther {
+        std::string title;
+        std::map<std::string, std::vector<int>> use;  // personaje -> slots que usa ese otro mod
+    };
+    struct ReslotAnalysisRes {
+        std::string folder;
+        reslot::Analysis an;
+        std::vector<ReslotOther> others;
+    };
+    struct ReslotApplyRes {
+        reslot::Problem p = reslot::Problem::None;
+        std::string err, folder;
+        int items = 0;
+    };
+    struct ReslotUi {
+        bool open = false, analyzing = false, applying = false;
+        std::string folder, title, dir;
+        reslot::Analysis an;
+        std::vector<ReslotOther> others;
+        std::vector<int> src, dst;
+        int sel = 0;
     };
     struct Badge {
         std::string text;
@@ -93,6 +140,13 @@ private:
     void updateDetail(const Input& in);
     void drawDetail();
     void queueDownload(const gb::Item& item, const gb::File& f);
+    void openCatPicker();
+    void requestCats(const gb::Category* target);
+    void rebuildShown();
+    void applyCategory(int64_t id, const std::string& name);
+    std::string catPathName(const gb::Category* extra) const;
+    void updateCatPicker(const Input& in);
+    void drawCatPicker();
     void queueNow(const gb::Item& item, const gb::File& f, const std::string& replace, const std::string& target);
 
     // --- instalados
@@ -102,6 +156,14 @@ private:
     void startModUpdate(size_t idx);
     void startSizeScan();
     static gb::Item itemFromMod(const Mod& m);
+
+    // --- reslotter
+    void openReslot(size_t idx);
+    void updateReslot(const Input& in);
+    void drawReslot();
+    bool reslotValid() const;
+    std::vector<std::string> reslotWarnings() const;
+    void startReslot();
 
     // --- descargas / perfiles / herramientas
     void updateDownloads(const Input& in);
@@ -156,6 +218,11 @@ private:
     // Páginas ya vistas (ir atrás/adelante es instantáneo) y petición pendiente mientras otra carga.
     std::map<std::string, gb::Page> pageCache_;
     std::vector<std::string> pageOrder_;
+    int64_t catId_ = 0;  // categoría activa (0 = todas)
+    std::string catName_;
+    CatPicker cp_;
+    Async<CatRes> catJob_;
+    int catToken_ = 0;
     std::string desiredKey_, jobKey_;
     int desiredPage_ = 1;
     bool wantPending_ = false;
@@ -180,6 +247,13 @@ private:
     Async<SizeRes> sizeJob_;
     bool sizesDirty_ = true;
 
+    // reslotter
+    ReslotUi rs_;
+    Async<ReslotAnalysisRes> rsAnalyze_;
+    Async<ReslotApplyRes> rsApply_;
+    std::atomic<int> rsDone_{0}, rsTotal_{0};
+    std::atomic<bool> rsCancel_{false};
+
     // descargas / perfiles / herramientas
     int dlSel_ = 0, profSel_ = 0, toolSel_ = 0;
     Async<ConflictRes> confJob_;
@@ -197,6 +271,9 @@ private:
     // barra inferior
     uint64_t freeSpace_ = 0;
     uint64_t lastStatus_ = 0;
+    int64_t lastWall_ = 0;  // reloj de pared y reloj monotónico del fotograma anterior (detectan la suspensión)
+    uint64_t lastMono_ = 0, lastSlowLog_ = 0;
+    int lastFaults_ = 0;
     Async<uint64_t> spaceJob_;  // statvfs de la SD puede tardar: se mide en un hilo
     int importCount_ = 0;
     bool importDirty_ = true;

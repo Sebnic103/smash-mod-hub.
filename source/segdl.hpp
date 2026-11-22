@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <string>
 
 #include "common.hpp"
@@ -40,6 +41,10 @@ struct SegOptions {
     uint64_t chunk = 1u << 20;     // tamaño de cada trozo
     int window = 12;               // trozos como máximo en memoria a la vez (adelantados al que toca escribir)
     int attempts = 4;              // intentos por trozo antes de rendirse
+    // Reanudar: ya hay "start" bytes buenos al principio del archivo y el archivo está colocado justo ahí.
+    uint64_t start = 0;
+    // Se llama con cada trozo, EN ORDEN y justo antes de escribirlo (para calcular el MD5 sobre la marcha).
+    std::function<void(const char*, size_t)> onData;
 };
 
 enum class SegStatus { Done, Cancelled, Unsupported, Failed };
@@ -47,9 +52,10 @@ struct SegResult {
     SegStatus st = SegStatus::Failed;
     std::string error;
     bool diskError = false;  // el fallo fue al escribir en la SD (no tiene sentido reintentar con otra conexión)
+    uint64_t written = 0;    // bytes buenos escritos desde el principio del archivo (incluye "start"); sirve para reanudar
 };
 
-// Descarga probe.size bytes de url y los escribe EN ORDEN en out (que debe estar vacío y en la posición 0).
+// Descarga los bytes [opt.start, probe.size) de url y los escribe EN ORDEN en out (posición opt.start; vacío si start=0).
 // Unsupported = el servidor no sirve trozos o no se pudieron crear hilos: el llamador debe volver a empezar
 // con una descarga normal (truncando el archivo).
 SegResult segmentedDownload(Transport& t, const std::string& url, const Probe& probe, FILE* out, Progress* prog, const SegOptions& opt = SegOptions());

@@ -5,6 +5,10 @@
 
 namespace sys {
 
+static std::atomic<int> g_faults{0};
+void noteFault() { g_faults++; }
+int faultCount() { return g_faults.load(); }
+
 #ifdef __SWITCH__
 
 namespace {
@@ -38,7 +42,13 @@ Mutex::Mutex() { mutexInit(&m_); }
 void Mutex::lock() { mutexLock(&m_); }
 void Mutex::unlock() { mutexUnlock(&m_); }
 
-void Thread::entry(void* arg) { static_cast<Thread*>(arg)->fn_(); }
+void Thread::entry(void* arg) {
+    try {
+        static_cast<Thread*>(arg)->fn_();
+    } catch (...) {
+        noteFault();
+    }
+}
 
 bool Thread::start(std::function<void()> fn, size_t stackSize) {
     join();
@@ -76,7 +86,13 @@ void Mutex::unlock() { m_.unlock(); }
 bool Thread::start(std::function<void()> fn, size_t) {
     join();
     fn_ = std::move(fn);
-    t_ = std::thread([this] { fn_(); });
+    t_ = std::thread([this] {
+        try {
+            fn_();
+        } catch (...) {
+            noteFault();
+        }
+    });
     started_ = true;
     return true;
 }

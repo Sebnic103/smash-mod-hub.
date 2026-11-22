@@ -23,7 +23,7 @@ suite() {  # $1 = ejecutable, resto = fuentes y opciones
 suite "$TMP/smash_mod_hub_tests" \
     test_core.cpp stub_http.cpp \
     ../source/sys.cpp ../source/util.cpp ../source/json.cpp ../source/md5.cpp \
-    ../source/segdl.cpp ../source/settings.cpp ../source/modstore.cpp ../source/installer.cpp ../source/gamebanana.cpp \
+    ../source/segdl.cpp ../source/settings.cpp ../source/modstore.cpp ../source/installer.cpp ../source/gamebanana.cpp ../source/reslot.cpp \
     -lpthread || exit $?
 
 # Lógica de texto de la interfaz (ajuste de línea, caché por frame) con un SDL/TTF falso

@@ -20,3 +20,5 @@ ssize_t archive_read_data(archive*, void*, size_t);
 int64_t archive_filter_bytes(archive*, int);
 const char* archive_entry_pathname(archive_entry*);
 unsigned archive_entry_filetype(archive_entry*);
+inline int64_t archive_entry_size(struct archive_entry*) { return 0; }
+inline int archive_entry_size_is_set(struct archive_entry*) { return 0; }

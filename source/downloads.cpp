@@ -1,5 +1,7 @@
 #include "downloads.hpp"
 
+#include <exception>
+
 #include <cstdio>
 #include <ctime>
 
@@ -129,7 +131,18 @@ void Downloads::run() {
             }
             continue;
         }
-        process(*job);
+        // Una excepción (p. ej. sin memoria) no debe tumbar toda la app: ese trabajo falla y se sigue.
+        try {
+            process(*job);
+        } catch (const std::exception& e) {
+            job->error = std::string(T("Error interno: ", "Internal error: ")) + e.what();
+            job->state = Job::Failed;
+            util::log("job %d excepción: %s", job->id, e.what());
+        } catch (...) {
+            job->error = T("Error interno", "Internal error");
+            job->state = Job::Failed;
+            util::log("job %d excepción desconocida", job->id);
+        }
     }
 }
 
@@ -156,6 +169,7 @@ void Downloads::process(Job& j) {
     // Los archivos importados son del usuario: solo se mueven a import/done al terminar bien.
     const bool deleteArchive = !local && !g_settings.keepArchives;
 
+    std::string downloadedMd5;
     // 1) Descarga
     if (!local) {
         j.state = Job::Downloading;
@@ -164,19 +178,23 @@ void Downloads::process(Job& j) {
         http::Result r = http::downloadBig(j.file.url, archive, &j.prog, g_settings.dlConns);
         if (j.prog.cancel.load()) return cancelled();
         if (!r.ok()) return fail(std::string(T("Descarga fallida: ", "Download failed: ")) + r.describe());
+        downloadedMd5 = r.md5;
     }
 
-    // 2) MD5 (si GameBanana lo informa)
+    // 2) MD5 (si GameBanana lo informa). Si la descarga por trozos ya lo calculó sobre la marcha, no se vuelve a leer el archivo.
     if (!local && g_settings.verifyMd5 && !j.file.md5.empty()) {
-        j.state = Job::Verifying;
-        j.prog.now = 0;
-        j.prog.total = util::fileSize(archive);
-        std::string h = md5::file(archive, &j.prog);
-        if (j.prog.cancel.load()) {
-            util::rmrf(archive);
-            return cancelled();
+        std::string h = downloadedMd5;
+        if (h.empty()) {
+            j.state = Job::Verifying;
+            j.prog.now = 0;
+            j.prog.total = util::fileSize(archive);
+            h = md5::file(archive, &j.prog);
+            if (j.prog.cancel.load()) {
+                util::rmrf(archive);
+                return cancelled();
+            }
         }
-        if (h != j.file.md5) {
+        if (h != util::lower(j.file.md5)) {
             util::rmrf(archive);
             return fail(T("El MD5 no coincide (descarga corrupta). Inténtalo de nuevo.", "MD5 mismatch (corrupt download). Try again."));
         }

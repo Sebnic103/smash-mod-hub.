@@ -1,8 +1,10 @@
 #include "http.hpp"
+#include "md5.hpp"
 
 #include <curl/curl.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <cstdio>
@@ -372,6 +374,8 @@ void init(const std::string& caPath) {
 
 void abortAll() { g_abort = true; }
 
+void dropIdle() { drainPool(); }
+
 void trimIdle() {
     sys::Lock l(g_poolMx);
     dropStaleLocked(sys::nowMs());
@@ -414,6 +418,14 @@ Result download(const std::string& url, const std::string& dest, Progress* progr
     return downloadSingle(url, dest, progress, Kind::Image, true);
 }
 
+// Tamaño de trozo según el archivo: pequeño en archivos chicos (el reparto entre conexiones sale parejo) y de hasta
+// 2 MB en los grandes (menos peticiones). Múltiplo de 64 KB.
+static uint64_t pickChunk(uint64_t size, int conns) {
+    uint64_t c = size / ((uint64_t)std::max(conns, 1) * 4);
+    c = std::min<uint64_t>(std::max<uint64_t>(c, 256u << 10), 2u << 20);
+    return c & ~((uint64_t)(64u << 10) - 1);
+}
+
 Result downloadBig(const std::string& url, const std::string& dest, Progress* progress, int conns) {
     Result r;
     if (conns > 1) {
@@ -427,40 +439,62 @@ Result downloadBig(const std::string& url, const std::string& dest, Progress* pr
         util::log("DL sonda %s: HTTP %ld, rangos=%s, tamaño=%llu", url.c_str(), pr.status, pr.ranges ? "si" : "no", (unsigned long long)pr.size);
         SegOptions opt;
         opt.conns = conns;
+        opt.chunk = pickChunk(pr.size, conns);
+        opt.window = std::max(conns * 2, (int)((16u << 20) / opt.chunk));  // ~16 MB en memoria como mucho
         if (pr.ok && pr.ranges && pr.size >= 2 * opt.chunk) {
             util::mkdirs(util::dirName(dest));
             const std::string part = dest + ".part";
-            FILE* f = fopen(part.c_str(), "wb");
-            if (!f) {
-                r.error = "no se pudo crear " + part;
-                return r;
-            }
-            std::vector<char> fbuf(1 << 17);
-            setvbuf(f, fbuf.data(), _IOFBF, fbuf.size());
-            SegResult sr = segmentedDownload(tr, url, pr, f, progress, opt);
-            const bool closed = fclose(f) == 0;
-            if (sr.st == SegStatus::Done && closed) {
-                unlink(dest.c_str());
-                if (rename(part.c_str(), dest.c_str()) != 0) {
+            md5::Hasher hasher;
+            opt.onData = [&hasher](const char* p, size_t n) { hasher.update(p, n); };
+            uint64_t written = 0;
+            const uint64_t t0 = sys::nowMs();
+            // Si la red se corta a mitad, se reanuda desde lo ya escrito (hasta 3 veces) en vez de empezar de cero.
+            for (int round = 0; round < 4; round++) {
+                FILE* f = fopen(part.c_str(), round == 0 ? "wb" : "r+b");
+                if (!f || (round > 0 && fseeko(f, (off_t)written, SEEK_SET) != 0)) {
+                    if (f) fclose(f);
                     unlink(part.c_str());
-                    r.error = "no se pudo renombrar el archivo descargado";
+                    r.error = "no se pudo crear " + part;
                     return r;
                 }
-                r.status = 200;
-                util::log("DL %s -> OK (%d conexiones)", url.c_str(), conns);
-                return r;
+                std::vector<char> fbuf(1 << 17);
+                setvbuf(f, fbuf.data(), _IOFBF, fbuf.size());
+                opt.start = written;
+                SegResult sr = segmentedDownload(tr, url, pr, f, progress, opt);
+                const bool closed = fclose(f) == 0;
+                if (sr.st == SegStatus::Done && closed) {
+                    unlink(dest.c_str());
+                    if (rename(part.c_str(), dest.c_str()) != 0) {
+                        unlink(part.c_str());
+                        r.error = "no se pudo renombrar el archivo descargado";
+                        return r;
+                    }
+                    r.status = 200;
+                    r.md5 = hasher.finish();
+                    const uint64_t ms = std::max<uint64_t>(1, sys::nowMs() - t0);
+                    util::log("DL %s -> OK (%d conexiones, trozos de %llu KB, %llu KB/s)", url.c_str(), conns, (unsigned long long)(opt.chunk >> 10), (unsigned long long)(pr.size * 1000 / 1024 / ms));
+                    return r;
+                }
+                if (sr.st == SegStatus::Cancelled) {
+                    unlink(part.c_str());
+                    r.error = "cancelado";
+                    return r;
+                }
+                if (sr.st == SegStatus::Done || sr.diskError) {  // no se pudo cerrar/escribir el archivo
+                    unlink(part.c_str());
+                    r.error = sr.error.empty() ? "error de escritura (¿SD llena?)" : sr.error;
+                    util::log("DL %s -> %s", url.c_str(), r.error.c_str());
+                    return r;
+                }
+                const bool progressed = sr.written > written;
+                written = sr.written;
+                util::log("DL %s: la descarga por trozos falló (%s) tras %llu bytes", url.c_str(), sr.error.c_str(), (unsigned long long)written);
+                if (sr.st == SegStatus::Unsupported || !closed || !progressed || written == 0 || round == 3 || (progress && progress->cancel.load())) break;
+                for (int i = 0; i < 25 && !(progress && progress->cancel.load()); i++) sys::sleepMs(40);  // un segundo de calma antes de reanudar
+                util::log("DL %s: se reanuda desde el byte %llu", url.c_str(), (unsigned long long)written);
             }
             unlink(part.c_str());
-            if (sr.st == SegStatus::Cancelled) {
-                r.error = "cancelado";
-                return r;
-            }
-            if (sr.st == SegStatus::Done || sr.diskError) {  // no se pudo cerrar/escribir el archivo
-                r.error = sr.error.empty() ? "error de escritura (¿SD llena?)" : sr.error;
-                util::log("DL %s -> %s", url.c_str(), r.error.c_str());
-                return r;
-            }
-            util::log("DL %s: la descarga por trozos falló (%s); se reintenta con una sola conexión", url.c_str(), sr.error.c_str());
+            util::log("DL %s: se reintenta con una sola conexión", url.c_str());
             if (progress) {
                 progress->now = 0;
                 progress->bps = 0;

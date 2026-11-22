@@ -15,12 +15,16 @@ void shutdown() {}
 bool tlsVerified() { return true; }
 void trimIdle() {}
 void abortAll() {}
+void dropIdle() {}
 
 Result get(const std::string& url, std::string& body, Progress*, long) {
     g_requested.push_back(url);
     Result r;
     for (const auto& kv : g_canned) {
-        if (url.compare(0, kv.first.size(), kv.first) == 0) {
+        // Clave terminada en '$' = la URL debe ser exactamente esa; si no, basta con que empiece así.
+        const bool exact = !kv.first.empty() && kv.first.back() == '$';
+        const std::string key = exact ? kv.first.substr(0, kv.first.size() - 1) : kv.first;
+        if (exact ? url == key : url.compare(0, key.size(), key) == 0) {
             body = kv.second;
             r.status = 200;
             return r;

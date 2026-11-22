@@ -7,11 +7,13 @@
 #include <switch.h>
 
 #include <cstdio>
+#include <exception>
 
 #include "app.hpp"
 #include "platform.hpp"
 #include "sys.hpp"
 #include "ui.hpp"
+#include "util.hpp"
 
 // Red con más margen que el de por defecto: búferes TCP de recepción grandes (ventana TCP mayor = más velocidad
 // en conexiones con latencia) y más sesiones BSD (con 3 solo pueden esperar datos 3 hilos a la vez; con las
@@ -58,11 +60,30 @@ int main(int, char**) {
         pad.init();
         App app;
         app.init(ren);
+        int faults = 0;  // fotogramas seguidos que terminaron en excepción
         while (appletMainLoop() && !app.wantsQuit()) {
             SDL_Event e;
             while (SDL_PollEvent(&e)) {
             }
-            app.frame(pad.poll());
+            // Una excepción en un fotograma (sin memoria, dato raro...) se anota y se sigue en vez de cerrar la app
+            // de golpe. Si se repite sin parar algo va muy mal: se sale limpiamente (guardando todo).
+            try {
+                app.frame(pad.poll());
+                faults = 0;
+            } catch (const std::exception& ex) {
+                util::log("EXCEPCIÓN en el fotograma: %s", ex.what());
+                faults++;
+            } catch (...) {
+                util::log("EXCEPCIÓN desconocida en el fotograma");
+                faults++;
+            }
+            if (faults > 0) {
+                ui::unclip();  // por si la excepción dejó un recorte activo
+                if (faults >= 30) {
+                    util::log("demasiadas excepciones seguidas: se cierra la app");
+                    break;
+                }
+            }
             SDL_RenderPresent(ren);
         }
         app.shutdown();

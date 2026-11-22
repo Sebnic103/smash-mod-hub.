@@ -1,4 +1,5 @@
 // Tests del núcleo (sin SDL ni libnx). Compilar con tests/run.sh
+#include <algorithm>
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
@@ -12,6 +13,7 @@
 #include "../source/json.hpp"
 #include "../source/md5.hpp"
 #include "../source/modstore.hpp"
+#include "../source/reslot.hpp"
 #include "../source/segdl.hpp"
 #include "../source/sys.hpp"
 #include "../source/settings.hpp"
@@ -68,6 +70,11 @@ static void testMd5() {
     std::string big(100000, 'a');
     util::writeFile("/tmp/md5_test.bin", big);
     CHECK(md5::file("/tmp/md5_test.bin") == md5::hex(big));
+    {
+        md5::Hasher h;
+        for (size_t i = 0; i < big.size(); i += 777) h.update(big.data() + i, std::min<size_t>(777, big.size() - i));
+        CHECK(h.finish() == md5::hex(big));
+    }
 }
 
 static void testUtil() {
@@ -183,6 +190,345 @@ static void testGb() {
     g_canned.clear();
     gb::Page bad = gb::browse(1, gb::Sort::Default, 20);
     CHECK(!bad.ok && !bad.err.empty());
+}
+
+
+static void testCategories() {
+    printf("gamebanana: categorías y filtros\n");
+    const std::string api = "https://gamebanana.com/apiv11";
+    paths::setRoot("/tmp/smh_test_cat");
+    util::rmrf("/tmp/smh_test_cat");
+    util::mkdirs(paths::cache());
+    gb::setGameId(6498);
+
+    // parseCategories: forma de Mod/Categories
+    {
+        json::Value v;
+        CHECK(json::parse(R"({"_aMetadata":{"_nRecordCount":3,"_bIsComplete":true},"_aRecords":[
+            {"_idRow":100,"_sModelName":"ModCategory","_sName":"Skins","_sProfileUrl":"https://gamebanana.com/mods/cats/100","_nItemCount":50},
+            {"_sName":"Final Smashes","_sProfileUrl":"https://gamebanana.com/mods/cats/101"},
+            {"_idRow":100,"_sName":"Duplicada"},
+            {"_idRow":0,"_sName":"Sin id"}]})", v));
+        std::vector<gb::Category> out;
+        bool complete = false;
+        CHECK(gb::parseCategories(v, out, &complete));
+        CHECK(complete);
+        CHECK(out.size() == 2);
+        CHECK(out[0].id == 100 && out[0].name == "Skins" && out[0].count == 50);
+        CHECK(out[1].id == 101 && out[1].name == "Final Smashes" && out[1].count == -1);
+        // si los registros son mods, no son categorías
+        json::Value m;
+        CHECK(json::parse(R"({"_aRecords":[{"_idRow":5,"_sModelName":"Mod","_sName":"x"}]})", m));
+        std::vector<gb::Category> none;
+        CHECK(!gb::parseCategories(m, none));
+        CHECK(gb::catIdFromUrl("https://gamebanana.com/mods/cats/12345") == 12345);
+        CHECK(gb::catIdFromUrl("https://gamebanana.com/mods/11") == 0);
+    }
+
+    const char* roots = R"({"_aMetadata":{"_nRecordCount":2,"_bIsComplete":true},"_aRecords":[
+        {"_idRow":100,"_sModelName":"ModCategory","_sName":"Skins","_sProfileUrl":"https://gamebanana.com/mods/cats/100"},
+        {"_idRow":101,"_sModelName":"ModCategory","_sName":"Final Smashes","_sProfileUrl":"https://gamebanana.com/mods/cats/101"}]})";
+    const char* kids = R"({"_aMetadata":{"_nRecordCount":2,"_bIsComplete":true},"_aRecords":[
+        {"_idRow":200,"_sModelName":"ModCategory","_sName":"Mario","_nItemCount":12},
+        {"_idRow":201,"_sModelName":"ModCategory","_sName":"Link","_nItemCount":7}]})";
+
+    // listado de la raíz: se prueba la primera variante, se guarda en caché y no se vuelve a pedir
+    g_canned.clear();
+    g_canned[api + "/Mod/Categories?_idGameRow=6498&_sSort=a_to_z&_nPage=1&_nPerpage=50$"] = roots;
+    g_requested.clear();
+    gb::CategoryList r0 = gb::categories(0);
+    CHECK(r0.ok && !r0.learned && !r0.stale && r0.cats.size() == 2 && r0.cats[0].name == "Skins");
+    size_t n1 = g_requested.size();
+    gb::CategoryList r0b = gb::categories(0);
+    CHECK(r0b.ok && r0b.cats.size() == 2);
+    CHECK(g_requested.size() == n1);  // desde la caché
+    CHECK(util::isFile(util::join(paths::cache(), "categories.json")));
+
+    // la caché del disco se recupera tras "reiniciar"
+    gb::setGameId(6498);  // vacía la memoria
+    g_canned.clear();     // sin red
+    gb::loadCategoryCache();
+    gb::CategoryList r0c = gb::categories(0);
+    CHECK(r0c.ok && r0c.cats.size() == 2);
+
+    // hijos: variante 1 rechazada (404) y variante 2 válida
+    g_canned.clear();
+    g_canned[api + "/Mod/Categories?_idCategoryRow=100&_nPage=1&_nPerpage=50$"] = kids;
+    gb::CategoryList k = gb::categories(100);
+    CHECK(k.ok && k.cats.size() == 2 && k.cats[0].id == 200 && k.cats[0].parent == 100);
+
+    // hoja: respuesta válida y vacía = sin subcategorías
+    g_canned.clear();
+    g_canned[api + "/Mod/Categories?_idCategoryRow=200&_sSort=a_to_z&_nPage=1&_nPerpage=50$"] = R"({"_aMetadata":{"_bIsComplete":true},"_aRecords":[]})";
+    gb::CategoryList leaf = gb::categories(200);
+    CHECK(leaf.ok && leaf.cats.empty());
+
+    // el servidor ignora _idCategoryRow y devuelve las raíces: se rechaza (no se muestran como hijos)
+    g_canned.clear();
+    g_canned[api + "/Mod/Categories?_idCategoryRow=101"] = roots;
+    gb::CategoryList bogus = gb::categories(101);
+    CHECK(!bogus.ok || bogus.cats.empty());
+
+    // sin respuesta de la API: se usan las categorías vistas en los mods ya cargados
+    gb::setGameId(6498);
+    util::rmrf(util::join(paths::cache(), "categories.json"));
+    g_canned.clear();
+    const char* feed = R"({"_aMetadata":{"_nRecordCount":2,"_bIsComplete":true},"_aRecords":[
+      {"_idRow":1,"_sModelName":"Mod","_sName":"Mario Rojo","_aGame":{"_idRow":6498},
+       "_aRootCategory":{"_sName":"Skins","_sProfileUrl":"https://gamebanana.com/mods/cats/100"},
+       "_aSubCategory":{"_sName":"Mario","_sProfileUrl":"https://gamebanana.com/mods/cats/200"}},
+      {"_idRow":2,"_sModelName":"Mod","_sName":"Nube","_aGame":{"_idRow":6498},
+       "_aRootCategory":{"_sName":"Skins","_sProfileUrl":"https://gamebanana.com/mods/cats/100"},
+       "_aSubCategory":{"_sName":"Cloud","_sProfileUrl":"https://gamebanana.com/mods/cats/201"}}]})";
+    g_canned[api + "/Game/6498/Subfeed?_nPage=1"] = feed;
+    gb::Page pf = gb::browse(1, gb::Sort::Default, 20);
+    CHECK(pf.ok && pf.items.size() == 2 && pf.items[0].rootCatId == 100 && pf.items[0].subCatId == 200);
+    g_canned.clear();
+    gb::CategoryList lr = gb::categories(0);
+    CHECK(lr.ok && lr.learned && lr.cats.size() == 1 && lr.cats[0].name == "Skins");
+    gb::CategoryList lc = gb::categories(100);
+    CHECK(lc.ok && lc.learned && lc.cats.size() == 2 && lc.cats[0].name == "Cloud");  // ordenadas por nombre
+    gb::CategoryList nothing = gb::categories(999);
+    CHECK(!nothing.ok && !nothing.err.empty());
+
+    // mods de una categoría
+    const char* idx = R"({"_aMetadata":{"_nRecordCount":2,"_bIsComplete":true},"_aRecords":[
+      {"_idRow":21,"_sModelName":"Mod","_sName":"Cloud Azul","_aSubmitter":{"_sName":"Ana"},"_aGame":{"_idRow":6498}},
+      {"_idRow":22,"_sModelName":"Mod","_sName":"Cloud Rojo","_aSubmitter":{"_sName":"Beto"},"_aGame":{"_idRow":6498}}]})";
+    const std::string base = api + "/Mod/Index?_nPage=1&_nPerpage=20&_aFilters%5BGeneric_Category%5D=201";
+    g_canned.clear();
+    g_canned[base + "$"] = idx;
+    g_requested.clear();
+    gb::Page c1 = gb::browseCategory(201, 1, gb::Sort::Default, 20);
+    CHECK(c1.ok && c1.items.size() == 2 && g_requested.size() == 1);
+    // orden "Nuevos": el servidor acepta Generic_Newest
+    g_canned.clear();
+    g_canned[base + "&_sSort=Generic_Newest$"] = idx;
+    CHECK(gb::browseCategory(201, 1, gb::Sort::New, 20).ok);
+    // orden "Actualizados": el servidor rechaza ambos valores -> se pide sin orden (y se recuerda)
+    g_canned.clear();
+    g_canned[base + "$"] = idx;
+    g_requested.clear();
+    gb::Page c2 = gb::browseCategory(201, 1, gb::Sort::Updated, 20);
+    CHECK(c2.ok && c2.items.size() == 2);
+    CHECK(g_requested.size() == 3);  // 2 variantes rechazadas + sin orden
+    g_requested.clear();
+    CHECK(gb::browseCategory(201, 1, gb::Sort::Updated, 20).ok);
+    CHECK(g_requested.size() == 1);  // ya se sabe que no hay orden válido
+    // fallo de red (no 4xx): no se prueban más variantes
+    g_canned.clear();
+    g_requested.clear();
+    gb::Page c3 = gb::browseCategory(201, 1, gb::Sort::Default, 20);
+    CHECK(!c3.ok && g_requested.size() == 1);
+
+    // búsqueda de texto dentro de la categoría (filtrado en local, con caché)
+    gb::clearFeedCache();
+    g_canned.clear();
+    g_canned[api + "/Mod/Index?_nPage=1&_nPerpage=50&_aFilters%5BGeneric_Category%5D=201$"] = idx;
+    gb::Page sc = gb::searchInCategory(201, "rojo");
+    CHECK(sc.ok && sc.items.size() == 1 && sc.items[0].id == 22 && sc.scanned == 2);
+    g_requested.clear();
+    gb::Page sc2 = gb::searchInCategory(201, "ana");  // también por autor, y desde la caché
+    CHECK(sc2.ok && sc2.items.size() == 1 && sc2.items[0].id == 21 && g_requested.empty());
+    g_canned.clear();
+    gb::clearFeedCache();
+    CHECK(!gb::searchInCategory(201, "x").ok);
+    gb::setGameId(6498);
+}
+
+// Lista ordenada de todas las rutas (relativas) de un árbol, para comparar antes/después.
+static void snapshotRec(const std::string& base, const std::string& rel, std::vector<std::string>& out) {
+    for (const auto& d : util::listDirs(util::join(base, rel))) {
+        out.push_back(rel + d + "/");
+        snapshotRec(base, rel + d + "/", out);
+    }
+    for (const auto& f : util::listFiles(util::join(base, rel))) out.push_back(rel + f);
+}
+static std::string snapshot(const std::string& base) {
+    std::vector<std::string> v;
+    snapshotRec(base, "", v);
+    std::sort(v.begin(), v.end());
+    std::string s;
+    for (const auto& x : v) s += x + "\n";
+    return s;
+}
+static bool has(const std::string& base, const std::string& rel) { return util::exists(util::join(base, rel)); }
+
+static void buildMario(const std::string& m, const std::string& slot /* "c00" */, const std::string& num /* "00" */) {
+    touch(m + "/fighter/mario/model/body/" + slot + "/model.nutexb", "body-" + slot);
+    touch(m + "/fighter/mario/model/hair/" + slot + "/h.nutexb");
+    touch(m + "/fighter/mario/motion/body/" + slot + "/a.nuanmb");
+    touch(m + "/fighter/kirby/model/copy_mario_cap/" + slot + "/k.nutexb");
+    touch(m + "/camera/fighter/mario/" + slot + "/cam.bin");
+    touch(m + "/effect/fighter/mario/ef_mario_" + slot + ".eff");
+    touch(m + "/effect/fighter/mario/trail_" + slot + "/t.bin");
+    touch(m + "/effect/fighter/mario/model/fire_" + slot + "/c00/inner.eff");
+    touch(m + "/sound/bank/fighter/se_mario_" + slot + ".nus3audio");
+    touch(m + "/sound/bank/fighter_voice/vc_mario_" + slot + ".nus3audio");
+    touch(m + "/ui/replace/chara/chara_0/chara_0_mario_" + num + ".bntx");
+    touch(m + "/ui/replace/chara/chara_1/chara_1_mario_" + num + ".bntx");
+}
+
+static void testReslot() {
+    printf("reslotter\n");
+    const std::string root = "/tmp/smh_test_reslot";
+    util::rmrf(root);
+    util::mkdirs(root);
+    const std::string journal = root + "/journal.json";
+
+    CHECK(reslot::renamedWithSlot("c02", 5) == "c05");
+    CHECK(reslot::renamedWithSlot("C02", 5) == "C05");
+    CHECK(reslot::renamedWithSlot("ef_mario_c01.eff", 3) == "ef_mario_c03.eff");
+    CHECK(reslot::renamedWithSlot("vc_ptrainer_low_c00.nus3audio", 7) == "vc_ptrainer_low_c07.nus3audio");
+    CHECK(reslot::renamedWithSlot("chara_3_mario_02.bntx", 6) == "chara_3_mario_06.bntx");
+    CHECK(reslot::renamedWithSlot("model.nutexb", 1).empty());
+    CHECK(reslot::renamedWithSlot("c0", 1).empty());
+    CHECK(reslot::renamedWithSlot("abc00", 1).empty());
+    CHECK(reslot::configMentionsSlots(R"({"new-dir-files":{"fighter/mario/model/body/c00":[]}})"));
+    CHECK(reslot::configMentionsSlots(R"({"x":"chara_0_mario_02.bntx"})"));
+    CHECK(!reslot::configMentionsSlots("{}"));
+    CHECK(!reslot::configMentionsSlots(R"({"share-to-vanilla":{"a":"b"}, "name":"abc00x"})"));
+
+    // --- análisis
+    const std::string m1 = root + "/mario";
+    buildMario(m1, "c00", "00");
+    touch(m1 + "/item/thing/c00/skip.nutexb");  // item/: no se toca
+    touch(m1 + "/fighter/mario/param/vl_c00.prc");  // con pinta de slot pero no reconocido
+    reslot::Analysis a = reslot::analyze(m1);
+    CHECK(a.ok());
+    CHECK(a.perFighter.size() == 1 && a.perFighter.count("mario") == 1);
+    CHECK(a.slots.size() == 1 && a.slots[0] == 0);
+    CHECK(a.items == 12);
+    CHECK(a.unknown.size() == 1);
+    CHECK(reslot::fighterSlots(m1).at("mario").size() == 1);
+
+    // --- reslotear c00 -> c03
+    const std::string before = snapshot(m1);
+    reslot::Plan plan;
+    CHECK(reslot::makePlan(m1, {{0, 3}}, plan) == reslot::Problem::None);
+    CHECK(plan.items == 12 && plan.ops.size() == 24);
+    CHECK(snapshot(m1) == before);  // preparar el plan no toca nada
+    std::string err;
+    std::atomic<int> prog{0};
+    CHECK(reslot::apply(plan, journal, &prog, nullptr, err) == reslot::Problem::None);
+    CHECK(prog.load() == 24);
+    CHECK(!util::exists(journal));
+    CHECK(has(m1, "fighter/mario/model/body/c03/model.nutexb") && !has(m1, "fighter/mario/model/body/c00"));
+    CHECK(has(m1, "fighter/mario/model/hair/c03/h.nutexb"));
+    CHECK(has(m1, "fighter/mario/motion/body/c03/a.nuanmb"));
+    CHECK(has(m1, "fighter/kirby/model/copy_mario_cap/c03/k.nutexb"));
+    CHECK(has(m1, "camera/fighter/mario/c03/cam.bin"));
+    CHECK(has(m1, "effect/fighter/mario/ef_mario_c03.eff") && has(m1, "effect/fighter/mario/trail_c03/t.bin"));
+    CHECK(has(m1, "effect/fighter/mario/model/fire_c03/c00/inner.eff"));  // la c00 interna se queda
+    CHECK(has(m1, "sound/bank/fighter/se_mario_c03.nus3audio") && has(m1, "sound/bank/fighter_voice/vc_mario_c03.nus3audio"));
+    CHECK(has(m1, "ui/replace/chara/chara_0/chara_0_mario_03.bntx") && has(m1, "ui/replace/chara/chara_1/chara_1_mario_03.bntx"));
+    CHECK(has(m1, "item/thing/c00/skip.nutexb"));
+    CHECK(reslot::analyze(m1).slots == std::vector<int>{3});
+
+    // --- intercambio c00 <-> c01 (necesita nombres temporales)
+    const std::string m2 = root + "/luigi";
+    touch(m2 + "/fighter/luigi/model/body/c00/a.nutexb", "AAA");
+    touch(m2 + "/fighter/luigi/model/body/c01/a.nutexb", "BBB");
+    touch(m2 + "/sound/bank/fighter_voice/vc_luigi_c01.nus3audio", "VOZ1");
+    CHECK(reslot::analyze(m2).slots == (std::vector<int>{0, 1}));
+    CHECK(reslot::makePlan(m2, {{0, 0}, {1, 0}}, plan) == reslot::Problem::BadMap);  // dos slots al mismo destino
+    CHECK(reslot::makePlan(m2, {{0, 1}}, plan) == reslot::Problem::BadMap);          // c01 existente quedaría repetido
+    CHECK(reslot::makePlan(m2, {{0, 9}}, plan) == reslot::Problem::BadMap);          // fuera de rango
+    CHECK(reslot::makePlan(m2, {{0, 1}, {1, 0}}, plan) == reslot::Problem::None);
+    CHECK(reslot::apply(plan, journal, nullptr, nullptr, err) == reslot::Problem::None);
+    std::string c;
+    CHECK(util::readFile(m2 + "/fighter/luigi/model/body/c00/a.nutexb", c) && c == "BBB");
+    CHECK(util::readFile(m2 + "/fighter/luigi/model/body/c01/a.nutexb", c) && c == "AAA");
+    CHECK(has(m2, "sound/bank/fighter_voice/vc_luigi_c00.nus3audio") && !has(m2, "sound/bank/fighter_voice/vc_luigi_c01.nus3audio"));
+    // desplazar todo +1 (c00->c01, c01->c02)
+    CHECK(reslot::makePlan(m2, {{0, 1}, {1, 2}}, plan) == reslot::Problem::None);
+    CHECK(reslot::apply(plan, journal, nullptr, nullptr, err) == reslot::Problem::None);
+    CHECK(has(m2, "fighter/luigi/model/body/c01") && has(m2, "fighter/luigi/model/body/c02") && !has(m2, "fighter/luigi/model/body/c00"));
+    CHECK(reslot::makePlan(m2, {}, plan) == reslot::Problem::NoSlots);  // nada que cambiar
+
+    // --- casos que se rechazan
+    const std::string m3 = root + "/conconfig";
+    touch(m3 + "/fighter/mario/model/body/c00/a");
+    touch(m3 + "/config.json", R"({"new-dir-files":{"fighter/mario/model/body/c08":[]}})");
+    CHECK(reslot::analyze(m3).problem == reslot::Problem::HasConfig);
+    CHECK(reslot::makePlan(m3, {{0, 1}}, plan) == reslot::Problem::HasConfig);
+    touch(m3 + "/config.json", "{}");  // config.json sin slots: no estorba
+    CHECK(reslot::makePlan(m3, {{0, 1}}, plan) == reslot::Problem::None);
+    const std::string m4 = root + "/extra";
+    touch(m4 + "/fighter/mario/model/body/c08/a");
+    CHECK(reslot::analyze(m4).problem == reslot::Problem::ExtraSlots);
+    const std::string m5 = root + "/sinslots";
+    touch(m5 + "/stage/x/y.bin");
+    CHECK(reslot::analyze(m5).problem == reslot::Problem::NoSlots);
+    CHECK(reslot::analyze(root + "/noexiste").problem == reslot::Problem::NotFound);
+
+    // --- fallo a mitad: se deshace todo
+    const std::string m6 = root + "/fallo";
+    buildMario(m6, "c01", "01");
+    const std::string snap6 = snapshot(m6);
+    CHECK(reslot::makePlan(m6, {{1, 5}}, plan) == reslot::Problem::None);
+    reslot::testFailAt = 9;
+    CHECK(reslot::apply(plan, journal, nullptr, nullptr, err) == reslot::Problem::Io);
+    reslot::testFailAt = -1;
+    CHECK(snapshot(m6) == snap6);
+    CHECK(!util::exists(journal));
+    CHECK(!err.empty());
+
+    // --- cancelación: nada cambia
+    std::atomic<bool> cancel{true};
+    CHECK(reslot::apply(plan, journal, nullptr, &cancel, err) == reslot::Problem::Cancelled);
+    CHECK(snapshot(m6) == snap6 && !util::exists(journal));
+
+    // --- apagón a mitad: recover() termina el trabajo
+    reslot::testCrashAt = 15;
+    CHECK(reslot::apply(plan, journal, nullptr, nullptr, err) == reslot::Problem::Io);
+    reslot::testCrashAt = -1;
+    CHECK(util::exists(journal));
+    CHECK(snapshot(m6) != snap6);
+    int resumed = reslot::recover(journal, err);
+    CHECK(resumed > 0);
+    CHECK(!util::exists(journal));
+    const std::string m7 = root + "/referencia";  // lo mismo hecho sin interrupciones
+    buildMario(m7, "c01", "01");
+    CHECK(reslot::makePlan(m7, {{1, 5}}, plan) == reslot::Problem::None);
+    CHECK(reslot::apply(plan, journal, nullptr, nullptr, err) == reslot::Problem::None);
+    CHECK(snapshot(m6) == snapshot(m7));
+    CHECK(reslot::recover(journal, err) == 0);  // sin diario no hay nada que hacer
+    // --- apagón / fallo en CUALQUIER punto del plan: recover() siempre llega al resultado final y un fallo deja el original
+    {
+        const std::string ref = snapshot(m7);
+        const std::string orig = snap6;
+        bool allOk = true;
+        for (int k = 0; k <= (int)plan.ops.size(); k++) {
+            const std::string mk = root + "/barrido";
+            util::rmrf(mk);
+            buildMario(mk, "c01", "01");
+            reslot::Plan pk;
+            if (reslot::makePlan(mk, {{1, 5}}, pk) != reslot::Problem::None) allOk = false;
+            reslot::testCrashAt = k;
+            reslot::apply(pk, journal, nullptr, nullptr, err);
+            reslot::testCrashAt = -1;
+            if (reslot::recover(journal, err) < 0) allOk = false;
+            std::string s1 = snapshot(mk);
+            std::string r1 = ref;
+            // los nombres de m7 y barrido solo difieren en la carpeta raíz: la instantánea es relativa, así que coinciden
+            if (s1 != r1) allOk = false;
+            util::rmrf(mk);
+            buildMario(mk, "c01", "01");
+            if (reslot::makePlan(mk, {{1, 5}}, pk) != reslot::Problem::None) allOk = false;
+            reslot::testFailAt = k;
+            reslot::apply(pk, journal, nullptr, nullptr, err);
+            reslot::testFailAt = -1;
+            if (snapshot(mk) != orig && k < (int)plan.ops.size()) allOk = false;
+            util::rmrf(journal);
+        }
+        CHECK(allOk);
+    }
+    // diario corrupto
+    util::writeFile(journal, "{{{");
+    CHECK(reslot::recover(journal, err) == -1 && !err.empty());
+    util::rmrf(journal + ".failed");
+    util::rmrf(root);
 }
 
 static void testInstallerAndStore() {
@@ -466,6 +812,80 @@ static void testSegdl() {
         CHECK(got == ft.data);
         CHECK(ft.usedOrig.load() >= 3);
     }
+    {  // MD5 incremental sobre la marcha (onData en orden) y reanudación desde un prefijo
+        FakeTransport ft;
+        ft.data = makeData(7u << 20);
+        ft.delayMs = 5;
+        http::SegOptions o;
+        o.conns = 4;
+        md5::Hasher h;
+        o.onData = [&h](const char* p, size_t n) { h.update(p, n); };
+        std::string got;
+        http::SegResult r = runSeg(ft, o, got);
+        CHECK(r.st == http::SegStatus::Done && got == ft.data);
+        CHECK(r.written == ft.data.size());
+        CHECK(h.finish() == md5::hex(ft.data));
+        // reanudar: el archivo ya tiene los primeros 3 MB + 12345 bytes
+        const size_t pre = (3u << 20) + 12345;
+        FakeTransport ft2;
+        ft2.data = ft.data;
+        ft2.delayMs = 3;
+        http::SegOptions o2;
+        o2.conns = 3;
+        o2.chunk = 512 * 1024;
+        o2.start = pre;
+        std::string seen;
+        o2.onData = [&seen](const char* p, size_t n) { seen.append(p, n); };
+        FILE* f = tmpfile();
+        fwrite(ft.data.data(), 1, pre, f);
+        http::Probe p = ft2.probe("u");
+        Progress pr;
+        http::SegResult r2 = http::segmentedDownload(ft2, "u", p, f, &pr, o2);
+        fflush(f);
+        std::string all((size_t)ftell(f), 0);
+        rewind(f);
+        CHECK(fread(&all[0], 1, all.size(), f) == all.size());
+        fclose(f);
+        CHECK(r2.st == http::SegStatus::Done && all == ft.data && seen == ft.data.substr(pre));
+        CHECK(pr.now.load() == ft.data.size());
+        // ya completo: no pide nada
+        FakeTransport ft3;
+        ft3.data = makeData(2u << 20);
+        http::SegOptions o3;
+        o3.start = ft3.data.size();
+        std::string none;
+        FILE* f3 = tmpfile();
+        http::Probe p3 = ft3.probe("u");
+        http::SegResult r3 = http::segmentedDownload(ft3, "u", p3, f3, nullptr, o3);
+        fclose(f3);
+        CHECK(r3.st == http::SegStatus::Done && ft3.calls.load() == 0 && r3.written == ft3.data.size());
+    }
+    {  // un trozo falla siempre: "written" indica el prefijo bueno, que sirve para reanudar
+        FakeTransport ft;
+        ft.data = makeData(8u << 20);
+        ft.alwaysFailChunk = 3;
+        http::SegOptions o;
+        o.conns = 2;
+        std::string got;
+        http::SegResult r = runSeg(ft, o, got);
+        CHECK(r.st == http::SegStatus::Failed);
+        CHECK(r.written == got.size() && r.written == 3u * (1u << 20));
+        CHECK(got == ft.data.substr(0, got.size()));
+        // reanudar con la red ya arreglada
+        ft.alwaysFailChunk = -1;
+        http::SegOptions o2;
+        o2.start = r.written;
+        FILE* f = tmpfile();
+        fwrite(got.data(), 1, got.size(), f);
+        http::Probe p = ft.probe("u");
+        http::SegResult r2 = http::segmentedDownload(ft, "u", p, f, nullptr, o2);
+        fflush(f);
+        std::string all((size_t)ftell(f), 0);
+        rewind(f);
+        CHECK(fread(&all[0], 1, all.size(), f) == all.size());
+        fclose(f);
+        CHECK(r2.st == http::SegStatus::Done && all == ft.data);
+    }
     {  // un trozo falla siempre: error, y lo escrito es un prefijo correcto
         FakeTransport ft;
         ft.data = makeData(8u << 20);
@@ -541,6 +961,8 @@ int main() {
     testUtil();
     testSafeRelative();
     testGb();
+    testCategories();
+    testReslot();
     testInstallerAndStore();
     testSegdl();
     printf(g_fail ? "\n%d FALLOS\n" : "\nTODO OK\n", g_fail);

@@ -18,7 +18,7 @@ struct Slot {
 struct Shared {
     Transport* t = nullptr;
     std::string url, effUrl;
-    uint64_t size = 0, chunk = 0, nChunks = 0;
+    uint64_t size = 0, chunk = 0, nChunks = 0, base = 0;  // base = desde dónde se descarga (reanudación)
     int window = 12, attempts = 4;
 
     sys::Mutex mx;
@@ -61,7 +61,7 @@ void worker(Shared& s, int w) {
             sys::sleepMs(4);
             continue;
         }
-        const uint64_t from = idx * s.chunk;
+        const uint64_t from = s.base + idx * s.chunk;
         const uint64_t to = std::min(s.size, from + s.chunk) - 1;
         const uint64_t len = to - from + 1;
         std::string data;
@@ -116,7 +116,15 @@ SegResult segmentedDownload(Transport& t, const std::string& url, const Probe& p
     s.effUrl = probe.url;
     s.size = probe.size;
     s.chunk = std::max<uint64_t>(opt.chunk, 1);
-    s.nChunks = (s.size + s.chunk - 1) / s.chunk;
+    s.base = std::min(opt.start, s.size);
+    s.doneBytes = s.base;
+    s.nChunks = (s.size - s.base + s.chunk - 1) / s.chunk;
+    if (s.nChunks == 0) {  // ya estaba todo
+        res.st = SegStatus::Done;
+        res.written = s.size;
+        if (prog) prog->now = prog->total = s.size;
+        return res;
+    }
     s.window = std::max(opt.window, 2);
     s.attempts = std::max(opt.attempts, 1);
     s.slots.resize((size_t)s.nChunks);
@@ -171,6 +179,7 @@ SegResult segmentedDownload(Transport& t, const std::string& url, const Probe& p
         }
         if (allDone) break;
         if (have) {
+            if (opt.onData) opt.onData(data.data(), data.size());
             if (fwrite(data.data(), 1, data.size(), out) != data.size()) {
                 writeErr = true;
                 break;
@@ -187,6 +196,7 @@ SegResult segmentedDownload(Transport& t, const std::string& url, const Probe& p
 
     s.stop = true;
     for (auto& th : threads) th->join();
+    res.written = std::min(s.size, s.base + std::min(s.writeIdx, s.nChunks) * s.chunk);
 
     if (cancelled) {
         res.st = SegStatus::Cancelled;
