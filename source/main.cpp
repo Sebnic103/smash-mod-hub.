@@ -62,13 +62,25 @@ int main(int, char**) {
         app.init(ren);
         int faults = 0;  // fotogramas seguidos que terminaron en excepción
         while (appletMainLoop() && !app.wantsQuit()) {
+            // Toques en la pantalla (modo portátil): SDL los da normalizados (0..1); se pasan a coordenadas de 1280x720.
+            bool tap = false;
+            int tapX = 0, tapY = 0;
             SDL_Event e;
             while (SDL_PollEvent(&e)) {
+                if (e.type == SDL_FINGERDOWN) {
+                    tap = true;
+                    tapX = (int)(e.tfinger.x * 1280.f);
+                    tapY = (int)(e.tfinger.y * 720.f);
+                }
             }
             // Una excepción en un fotograma (sin memoria, dato raro...) se anota y se sigue en vez de cerrar la app
             // de golpe. Si se repite sin parar algo va muy mal: se sale limpiamente (guardando todo).
             try {
-                app.frame(pad.poll());
+                Input in = pad.poll();
+                in.tap = tap;
+                in.tapX = tapX;
+                in.tapY = tapY;
+                app.frame(in);
                 faults = 0;
             } catch (const std::exception& ex) {
                 util::log("EXCEPCIÓN en el fotograma: %s", ex.what());

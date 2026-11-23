@@ -21,6 +21,12 @@ void Settings::load() {
     if (dlConns < 1) dlConns = 1;
     if (dlConns > 6) dlConns = 6;
     if (gameId <= 0) gameId = 6498;
+    systemKeyboard = v["system_keyboard"].boolean(systemKeyboard);
+    musicMode = (int)v["music_mode"].i64(musicMode);
+    if (musicMode < 0 || musicMode > 2) musicMode = 1;
+    volume = (int)v["volume"].i64(volume);
+    if (volume < 0) volume = 0;
+    if (volume > 100) volume = 100;
 }
 
 void Settings::save() const {
@@ -31,5 +37,8 @@ void Settings::save() const {
     v.set("verify_md5", json::Value::B(verifyMd5));
     v.set("per_page", json::Value::N(perPage));
     v.set("dl_conns", json::Value::N(dlConns));
+    v.set("system_keyboard", json::Value::B(systemKeyboard));
+    v.set("music_mode", json::Value::N(musicMode));
+    v.set("volume", json::Value::N(volume));
     util::writeFileAtomic(paths::settingsFile(), v.dump(2));
 }

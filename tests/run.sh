@@ -28,3 +28,9 @@ suite "$TMP/smash_mod_hub_tests" \
 
 # Lógica de texto de la interfaz (ajuste de línea, caché por frame) con un SDL/TTF falso
 suite "$TMP/smash_mod_hub_test_ui" -Istubs test_ui.cpp ../source/ui.cpp || exit $?
+
+# Teclado en pantalla (lógica de texto, cursor, navegación y toques)
+suite "$TMP/smash_mod_hub_test_osk" test_osk.cpp ../source/osk.cpp || exit $?
+
+# Música: notas, canciones, sintetizador, lectura de .wav y motor de mezcla
+suite "$TMP/smash_mod_hub_test_audio" test_audio.cpp ../source/synth.cpp ../source/wavfile.cpp ../source/music.cpp || exit $?

@@ -321,6 +321,31 @@ void imageContain(SDL_Texture* t, int x, int y, int w, int h) {
     SDL_RenderCopy(R, t, nullptr, &dst);
 }
 
+std::vector<std::pair<std::string, std::string>> splitHints(const std::string& s) {
+    std::vector<std::pair<std::string, std::string>> out;
+    size_t pos = 0;
+    while (pos < s.size()) {
+        size_t e = s.find("   ", pos);
+        const size_t end = e == std::string::npos ? s.size() : e;
+        std::string seg = s.substr(pos, end - pos);
+        size_t a = seg.find_first_not_of(' ');
+        if (a != std::string::npos) {
+            seg = seg.substr(a);
+            const size_t sp = seg.find(' ');
+            if (sp == std::string::npos) {
+                out.emplace_back(seg, "");
+            } else {
+                const size_t b = seg.find_first_not_of(' ', sp);
+                out.emplace_back(seg.substr(0, sp), b == std::string::npos ? "" : seg.substr(b));
+            }
+        }
+        if (e == std::string::npos) break;
+        pos = s.find_first_not_of(' ', e);
+        if (pos == std::string::npos) break;
+    }
+    return out;
+}
+
 void clip(int x, int y, int w, int h) {
     SDL_Rect r = {x, y, w, h};
     SDL_RenderSetClipRect(R, &r);

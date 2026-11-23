@@ -7,6 +7,8 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include "audio.hpp"
+#include "theme.hpp"
 #include "http.hpp"
 #include "platform.hpp"
 #include "settings.hpp"
@@ -14,7 +16,7 @@
 #include "util.hpp"
 
 #ifndef APP_VERSION_STR
-#define APP_VERSION_STR "1.2.0"
+#define APP_VERSION_STR "1.3.0"
 #endif
 
 namespace col = ui::col;
@@ -140,6 +142,19 @@ bool App::init(SDL_Renderer* r) {
     }
     http::init("romfs:/cacert.pem");
     img_.init(r, paths::cache());
+    {  // fondo: una imagen propia (switch/smash-mod-hub/background.png|jpg) o el que genera la app
+        std::string bg;
+        for (const char* n : {"background.png", "background.jpg", "background.jpeg"}) {
+            const std::string p = util::join(paths::data(), n);
+            if (util::isFile(p)) {
+                bg = p;
+                break;
+            }
+        }
+        theme::init(r, bg);
+    }
+    if (!audio::init(g_settings.musicMode, g_settings.volume)) util::log("música: sin audio");
+    util::log("modo applet: %s", platform::appletMode() ? "sí (poca memoria; mejor abrir con un juego, R al lanzarlo)" : "no");
     store_.load();
     dl_.start();
     startedAt_ = sys::nowMs();
@@ -165,6 +180,8 @@ void App::shutdown() {
     catJob_.join();
     rsAnalyze_.join();
     rsApply_.join();
+    audio::shutdown();
+    theme::shutdown();
     img_.shutdown();
     store_.save();
     http::shutdown();
@@ -524,6 +541,7 @@ void App::loadPage(int page) {
     desiredPage_ = p;
     desiredKey_ = pageKey(p);
     pageErr_.clear();
+    if (pageJob_.busy.load() && jobKey_ != desiredKey_) gb::cancelSearch();  // la carga en marcha ya no interesa: que pare
     auto it = pageCache_.find(desiredKey_);
     if (it != pageCache_.end()) {
         wantPending_ = false;
@@ -582,11 +600,13 @@ void App::updateBrowse(const Input& in) {
         loadPage(pageNo_);
     }
     if (in.y) {
-        std::string q;
-        if (platform::textInput(S("Buscar mods", "Search mods"), query_, q, 50) && util::trim(q) != query_) {
-            query_ = util::trim(q);
+        askText(S("Buscar mods", "Search mods"), query_, 50, false, [this](const std::string& text) {
+            const std::string q = util::trim(text);
+            if (q == query_) return;
+            query_ = q;
             loadPage(1);
-        }
+        });
+        return;
     }
     if (in.x) {
         if (!query_.empty()) {
@@ -613,7 +633,7 @@ void App::updateBrowse(const Input& in) {
 
 void App::drawBrowse() {
     const int areaY = HEAD + SUB, areaH = H - FOOT - areaY;
-    ui::fill(0, HEAD, W, SUB, col::panel);
+    theme::subbar(HEAD, SUB, col::accent);
     std::string left = query_.empty() ? S("Orden: ", "Sort: ") + sortName(sort_) : S("Búsqueda: ", "Search: ") + "\"" + query_ + "\"";
     if (catId_ > 0) left += "   -   " + S("Filtro: ", "Filter: ") + (catName_.empty() ? S("(categoría)", "(category)") : catName_);
     ui::text(left, 30, HEAD + 6, ui::SMALL, catId_ > 0 ? col::accent : col::text, 700);
@@ -626,13 +646,18 @@ void App::drawBrowse() {
         if (!loadingNow && pages >= pageNo_ && (int)page_.items.size() <= per && pages > 1) right += S(" de ", " of ") + std::to_string(pages);
     }
     if (!page_.items.empty()) right += "   -   " + std::to_string(page_.items.size()) + S(" mods", " mods");
-    if (page_.scanned > 0 && !loadingNow) right = S("Buscado en ", "Searched ") + std::to_string(page_.scanned) + S(" mods de la categoría", " mods in the category");
+    if (page_.scanned > 0 && !loadingNow) right = S("Buscado en ", "Searched ") + std::to_string(page_.scanned) + (catId_ > 0 ? S(" mods de la categoría", " mods in the category") : S(" mods recientes", " recent mods"));
     ui::text(right, W - 530, HEAD + 6, ui::SMALL, col::dim, 500, 2);
 
     bool busy = loadingNow;
     if (page_.items.empty()) {
         if (busy || !pageLoaded_) {
-            drawCenterMessage(S("Cargando", "Loading") + std::string((size_t)((now_ / 350) % 4), '.'), S("Conectando con GameBanana", "Connecting to GameBanana"), col::text);
+            std::string sub = S("Conectando con GameBanana", "Connecting to GameBanana");
+            int done = 0, total = 0;
+            gb::searchProgress(done, total);
+            if (!query_.empty() && total > 0) sub = S("Buscando \"", "Searching \"") + query_ + "\"   -   " + S("página ", "page ") + std::to_string(std::min(done + 1, total)) + "/" + std::to_string(total);
+            else if (!query_.empty()) sub = S("Buscando \"", "Searching \"") + query_ + "\" " + S("en GameBanana", "on GameBanana");
+            drawCenterMessage((query_.empty() ? S("Cargando", "Loading") : S("Buscando", "Searching")) + std::string((size_t)((now_ / 350) % 4), '.'), sub, col::text);
         } else if (!pageErr_.empty()) {
             drawCenterMessage(S("No se pudo conectar", "Could not connect"), pageErr_ + "   -   " + S("A: reintentar", "A: retry"), col::bad);
         } else {
@@ -759,12 +784,12 @@ void App::updateCatPicker(const Input& in) {
     if (in.zl) cp_.sel = std::max(0, cp_.sel - kCatRows);
     if (in.zr) cp_.sel = std::min(n - 1, cp_.sel + kCatRows);
     if (in.y) {
-        std::string out;
-        if (platform::textInput(S("Buscar en la lista de categorías", "Search the category list"), cp_.filter, out, 40)) {
-            cp_.filter = util::trim(out);
+        askText(S("Buscar en la lista de categorías", "Search the category list"), cp_.filter, 40, false, [this](const std::string& text) {
+            if (!cp_.open) return;
+            cp_.filter = util::trim(text);
             cp_.sel = 0;
             rebuildShown();
-        }
+        });
         return;
     }
     if (!(in.a || in.x)) return;
@@ -782,13 +807,12 @@ void App::updateCatPicker(const Input& in) {
 void App::drawCatPicker() {
     ui::fill(0, 0, W, H, ui::Color(0, 0, 0, 200));
     const int x = 50, y = 30, w = W - 100, h = H - 60;
-    ui::fill(x, y, w, h, col::panel);
-    ui::outline(x, y, w, h, col::accent, 3);
+    theme::panel(x, y, w, h, col::accent);
     std::string title = S("Filtrar por categoría", "Filter by category");
     const std::string path = catPathName(nullptr);
     if (!path.empty()) title += ":  " + path;
-    ui::text(title, x + 24, y + 14, ui::BIG, col::text, w - 48);
-    const int ay = y + 70;
+    ui::text(title, x + 28, y + 20, ui::BIG, col::text, w - 56 - 220);
+    const int ay = y + 78;
     if (cp_.levels.empty()) {
         if (cp_.loading) ui::text(S("Cargando categorías", "Loading categories") + std::string((size_t)((now_ / 350) % 4), '.'), x, ay + 160, ui::NORMAL, col::text, w, 1);
         else ui::text(S("No se pudieron cargar las categorías: ", "Could not load categories: ") + cp_.err + "   -   " + S("A: reintentar", "A: retry"), x + 30, ay + 160, ui::NORMAL, col::bad, w - 60, 1);
@@ -798,27 +822,26 @@ void App::drawCatPicker() {
         if (lv.learned) note = S("Lista parcial: solo categorías vistas en los mods ya cargados", "Partial list: only categories seen in the mods already loaded");
         else if (lv.stale) note = S("Sin conexión: lista guardada de la última vez", "Offline: list saved from last time");
         if (!cp_.filter.empty()) note += (note.empty() ? "" : "   -   ") + S("Texto: \"", "Text: \"") + cp_.filter + "\"";
-        if (!note.empty()) ui::text(note, x + 24, y + 52, ui::SMALL, col::warn, w - 48);
+        if (!note.empty()) ui::text(note, x + 28, y + 56, ui::SMALL, col::warn, w - 56);
         const int n = 1 + (int)cp_.shown.size();
         const int first = std::max(0, std::min(cp_.sel - kCatRows / 2, n - kCatRows));
         for (int i = first; i < std::min(n, first + kCatRows); i++) {
             const int ry = ay + (i - first) * kCatRowH;
             const bool sel = i == cp_.sel;
-            ui::fill(x + 20, ry, w - 60, kCatRowH - 4, sel ? col::panelHi : col::bg);
-            if (sel) ui::outline(x + 20, ry, w - 60, kCatRowH - 4, col::accent, 2);
+            theme::row(x + 24, ry, w - 68, kCatRowH - 4, sel, col::accent);
             if (i == 0) {
-                ui::text(lv.id == 0 ? S("Todas las categorías (quitar filtro)", "All categories (remove filter)") : S("Todo en ", "Everything in ") + lv.name, x + 36, ry + 3, ui::NORMAL, col::accent, w - 120);
+                ui::text(lv.id == 0 ? S("Todas las categorías (quitar filtro)", "All categories (remove filter)") : S("Todo en ", "Everything in ") + lv.name, x + 44, ry + 3, ui::NORMAL, col::accent, w - 130);
             } else {
                 const gb::Category& c = lv.cats[(size_t)cp_.shown[(size_t)i - 1]];
-                ui::text(c.name, x + 36, ry + 3, ui::NORMAL, col::text, w - 300);
-                if (c.count >= 0) ui::text(count(c.count), x + w - 220, ry + 3, ui::NORMAL, col::dim, 160, 2);
+                ui::text(c.name, x + 44, ry + 3, ui::NORMAL, sel ? col::white : col::text, w - 310);
+                if (c.count >= 0) ui::text(count(c.count), x + w - 240, ry + 3, ui::NORMAL, col::dim, 160, 2);
             }
         }
         if (cp_.shown.empty() && !cp_.filter.empty()) ui::text(S("Sin coincidencias", "No matches"), x, ay + 60, ui::NORMAL, col::dim, w, 1);
         ui::scrollbar(x + w - 28, ay, kCatRows * kCatRowH, kCatRows * kCatRowH, n * kCatRowH, first * kCatRowH);
-        if (cp_.loading) ui::text(S("Cargando", "Loading") + std::string((size_t)((now_ / 350) % 4), '.'), x + w - 260, y + 18, ui::NORMAL, col::accent, 220, 2);
+        if (cp_.loading) ui::text(S("Cargando", "Loading") + std::string((size_t)((now_ / 350) % 4), '.'), x + w - 250, y + 26, ui::NORMAL, col::accent, 220, 2);
     }
-    ui::text(S("A Abrir   X Filtrar aquí   Y Buscar en la lista   B Atrás   ZL/ZR Saltar", "A Open   X Filter here   Y Search list   B Back   ZL/ZR Jump"), x, y + h - 40, ui::SMALL, col::dim, w, 1);
+    theme::hints(S("A Abrir   X Filtrar aquí   Y Buscar   B Atrás   ZL/ZR Saltar", "A Open   X Filter here   Y Search   B Back   ZL/ZR Jump"), x + 28, y + h - 42, w - 56);
 }
 
 // ============================================================================ detalle
@@ -859,27 +882,35 @@ void App::updateDetail(const Input& in) {
 }
 
 void App::drawDetail() {
-    ui::fill(0, 0, W, H, col::bg);
+    ui::fill(0, 0, W, H, ui::Color(10, 11, 17, 205));  // semitransparente: se sigue viendo el fondo del tema
     ui::fill(0, 0, W, HEAD, col::header);
-    ui::text(det_.item.name, 30, 12, ui::BIG, col::text, W - 60);
+    ui::fill(0, HEAD - 2, W, 2, col::accent.withAlpha(80));
+    theme::slant(-30, 0, 62, HEAD - 2, 20, col::accent);
+    ui::text(det_.item.name, 50, 12, ui::BIG, col::text, W - 90);
 
     // --- imagen
     const int lx = 40, ly = HEAD + 16, lw = 640, lh = 360;
+    theme::shadow(lx, ly, lw, lh, 8);
     ui::fill(lx, ly, lw, lh, col::placeholder);
     std::string url = det_.item.galleryUrl((size_t)detImg_);
     SDL_Texture* t = url.empty() ? nullptr : img_.get(url, true);
     if (t) ui::imageContain(t, lx, ly, lw, lh);
     else ui::text(url.empty() ? S("Sin imagen", "No image") : S("Cargando imagen...", "Loading image..."), lx, ly + lh / 2 - 12, ui::NORMAL, col::dim, lw, 1);
+    ui::outline(lx, ly, lw, lh, col::panelHi, 2);
     if (det_.item.images.size() > 1) {
-        std::string n = "< " + std::to_string(detImg_ + 1) + " / " + std::to_string(det_.item.images.size()) + " >";
-        int tw = ui::textWidth(n, ui::SMALL) + 20;
-        ui::fill(lx + lw - tw - 10, ly + 10, tw, 28, col::bg.withAlpha(200));
-        ui::text(n, lx + lw - tw, ly + 12, ui::SMALL, col::text);
+        std::string n = std::to_string(detImg_ + 1) + " / " + std::to_string(det_.item.images.size());
+        int tw = ui::textWidth(n, ui::SMALL) + 56;
+        theme::slant(lx + lw - tw - 10, ly + 10, tw, 28, 8, ui::Color(8, 9, 14, 220));
+        ui::text("<", lx + lw - tw + 2, ly + 13, ui::SMALL, detImg_ > 0 ? col::accent : col::dim, 24, 1);
+        ui::text(n, lx + lw - tw + 14, ly + 13, ui::SMALL, col::text, tw - 28, 1);
+        ui::text(">", lx + lw - 38, ly + 13, ui::SMALL, detImg_ + 1 < (int)det_.item.images.size() ? col::accent : col::dim, 24, 1);
     }
 
     // --- descripción (se desplaza con el stick derecho)
-    const int dy = ly + lh + 12, dh = H - FOOT - dy;
+    const int dy = ly + lh + 14, dh = H - FOOT - dy - 6;
+    theme::shadow(lx, dy, lw, dh, 5);
     ui::fill(lx, dy, lw, dh, col::panel);
+    ui::fill(lx, dy, lw, 3, col::accent.withAlpha(110));
     if (!det_.text.empty()) {
         const int tw = lw - 24;
         int total = ui::textWrapped(det_.text, lx + 12, dy + 8, tw, ui::SMALL, col::text, (int)detTextScroll_, dh - 16);
@@ -920,8 +951,9 @@ void App::drawDetail() {
 
     // --- archivos
     y += 8;
-    ui::text(S("Archivos", "Files"), rx, y, ui::NORMAL, col::accent);
-    y += 32;
+    theme::slant(rx, y + 4, 8, 22, 0, col::accent);
+    ui::text(S("Archivos", "Files"), rx + 18, y, ui::NORMAL, col::accent);
+    y += 36;
     const int rowH = 54, maxRows = 5;
     if (!detLoaded_) {
         ui::text(S("Cargando archivos", "Loading files") + std::string((size_t)((now_ / 350) % 4), '.'), rx, y, ui::NORMAL, col::dim);
@@ -935,24 +967,32 @@ void App::drawDetail() {
             const gb::File& f = det_.files[(size_t)i];
             int ry = y + (i - first) * rowH;
             bool sel = i == detFile_;
-            ui::fill(rx, ry, rw, rowH - 4, sel ? col::panelHi : col::panel);
-            if (sel) ui::outline(rx, ry, rw, rowH - 4, col::accent, 2);
+            theme::row(rx, ry, rw, rowH - 6, sel, col::accent);
             bool installed = mi >= 0 && store_.mods()[(size_t)mi].meta.fileId == f.id;
-            ui::text(f.name, rx + 10, ry + 2, ui::NORMAL, col::text, rw - 20 - (installed ? 120 : 0));
+            const int bw = installed ? ui::textWidth(S("INSTALADO", "INSTALLED"), ui::SMALL) + 24 : 0;
+            ui::text(f.name, rx + 18, ry + 2, ui::NORMAL, sel ? col::white : col::text, rw - 30 - (installed ? bw + 6 : 0));
             std::string sub = util::humanSize(f.size);
             if (f.added) sub += "  -  " + util::formatDate(f.added);
             if (!f.desc.empty()) sub += "  -  " + f.desc;
-            ui::text(sub, rx + 10, ry + 28, ui::SMALL, col::dim, rw - 20);
-            if (installed) ui::text(S("INSTALADO", "INSTALLED"), rx + rw - 120, ry + 4, ui::SMALL, col::good, 110, 2);
+            ui::text(sub, rx + 18, ry + 27, ui::SMALL, col::dim, rw - 30);
+            if (installed) {
+                theme::slant(rx + rw - bw - 8, ry + 5, bw, 22, 8, col::good);
+                ui::text(S("INSTALADO", "INSTALLED"), rx + rw - bw - 8, ry + 5, ui::SMALL, kInk, bw, 1);
+            }
         }
         if (n > maxRows) ui::text(std::to_string(detFile_ + 1) + " / " + std::to_string(n), rx, y + maxRows * rowH, ui::SMALL, col::dim, rw, 2);
 
         // botón de descarga
         const gb::File& f = det_.files[(size_t)detFile_];
-        ui::fill(rx, H - FOOT - 70, rw, 56, col::accent);
-        ui::text("A   " + (mi >= 0 ? S("Reemplazar", "Replace") : S("Descargar", "Download")) + "  (" + util::humanSize(f.size) + ")", rx, H - FOOT - 70 + 14, ui::NORMAL, col::white, rw, 1);
+        const int by = H - FOOT - 70;
+        theme::shadow(rx, by, rw, 56, 6);
+        ui::fill(rx, by, rw, 56, col::accent);
+        ui::fill(rx, by, rw, 2, ui::Color(255, 255, 255, 60));
+        ui::fill(rx + 14, by + 12, 32, 32, ui::Color(0, 0, 0, 70));
+        ui::text("A", rx + 14, by + 16, ui::NORMAL, col::white, 32, 1);
+        ui::text((mi >= 0 ? S("Reemplazar", "Replace") : S("Descargar", "Download")) + "  (" + util::humanSize(f.size) + ")", rx + 58, by + 14, ui::NORMAL, col::white, rw - 72);
     }
-    drawFooter(S("A Descargar   B Volver   Izq/Der Capturas   Arriba/Abajo Archivo   Stick der. Descripción", "A Download   B Back   Left/Right Screenshots   Up/Down File   R stick Description"));
+    drawFooter(S("A Descargar   B Volver   Izq/Der Capturas   Arr/Abj Archivo   Stick Texto", "A Download   B Back   Left/Right Screenshots   Up/Down File   Stick Text"));
 }
 
 // ============================================================================ instalados
@@ -1003,7 +1043,7 @@ void App::updateInstalled(const Input& in) {
 
 void App::drawInstalled() {
     const int areaY = HEAD + SUB, areaH = H - FOOT - areaY;
-    ui::fill(0, HEAD, W, SUB, col::panel);
+    theme::subbar(HEAD, SUB, col::accent);
     const auto& mods = store_.mods();
     int up = 0;
     for (const auto& m : mods) up += m.hasUpdate() ? 1 : 0;
@@ -1162,18 +1202,17 @@ void App::updateReslot(const Input& in) {
 void App::drawReslot() {
     ui::fill(0, 0, W, H, ui::Color(0, 0, 0, 200));
     const int x = 50, y = 30, w = W - 100, h = H - 60;
-    ui::fill(x, y, w, h, col::panel);
-    ui::outline(x, y, w, h, col::accent, 3);
-    ui::text(S("Reslottear: ", "Reslot: ") + rs_.title, x + 24, y + 14, ui::BIG, col::text, w - 48);
-    int cy = y + 70;
+    theme::panel(x, y, w, h, col::accent);
+    ui::text(S("Reslottear: ", "Reslot: ") + rs_.title, x + 28, y + 20, ui::BIG, col::text, w - 56);
+    int cy = y + 80;
     if (rs_.analyzing) {
         ui::text(S("Analizando el mod", "Analysing the mod") + std::string((size_t)((now_ / 350) % 4), '.'), x, cy + 150, ui::NORMAL, col::text, w, 1);
-        ui::text(S("B  Cancelar", "B  Cancel"), x, y + h - 40, ui::SMALL, col::dim, w, 1);
+        theme::hints(S("B Cancelar", "B Cancel"), x + 28, y + h - 42, w - 56, true);
         return;
     }
     if (!rs_.an.ok()) {
         ui::textWrapped(reslotProblemText(rs_.an.problem), x + 30, cy + 40, w - 60, ui::NORMAL, col::warn, 0, 300);
-        ui::text(S("A / B  Cerrar", "A / B  Close"), x, y + h - 40, ui::SMALL, col::dim, w, 1);
+        theme::hints(S("A/B Cerrar", "A/B Close"), x + 28, y + h - 42, w - 56, true);
         return;
     }
     std::string fighters;
@@ -1191,14 +1230,13 @@ void App::drawReslot() {
     for (size_t i = 0; i < rs_.src.size(); i++) {
         const int ry = cy + (int)i * 40;
         const bool sel = (int)i == rs_.sel;
-        ui::fill(x + 30, ry, 560, 36, sel ? col::panelHi : col::bg);
-        if (sel) ui::outline(x + 30, ry, 560, 36, col::accent, 2);
+        theme::row(x + 30, ry, 560, 34, sel, col::accent);
         const bool dup = rs_.dst[i] >= 0 && rs_.dst[i] <= reslot::kMaxSlot && useCount[(size_t)rs_.dst[i]] > 1;
         const bool changed = rs_.dst[i] != rs_.src[i];
-        ui::text(slotName(rs_.src[i]), x + 50, ry + 4, ui::NORMAL, col::text, 90);
-        ui::text("->", x + 150, ry + 4, ui::NORMAL, col::dim, 50);
-        ui::text((sel ? "<  " : "   ") + slotName(rs_.dst[i]) + (sel ? "  >" : ""), x + 215, ry + 4, ui::NORMAL, dup ? col::bad : (changed ? col::good : col::dim), 160);
-        ui::text(dup ? S("repetido", "duplicate") : (changed ? S("cambia", "changes") : S("sin cambios", "unchanged")), x + 420, ry + 4, ui::SMALL, dup ? col::bad : col::dim, 160);
+        ui::text(slotName(rs_.src[i]), x + 54, ry + 3, ui::NORMAL, sel ? col::white : col::text, 90);
+        ui::text("->", x + 150, ry + 3, ui::NORMAL, col::dim, 50);
+        ui::text((sel ? "<  " : "   ") + slotName(rs_.dst[i]) + (sel ? "  >" : ""), x + 215, ry + 3, ui::NORMAL, dup ? col::bad : (changed ? col::good : col::dim), 160);
+        ui::text(dup ? S("repetido", "duplicate") : (changed ? S("cambia", "changes") : S("sin cambios", "unchanged")), x + 420, ry + 6, ui::SMALL, dup ? col::bad : col::dim, 160);
     }
     int wy = cy + (int)rs_.src.size() * 40 + 8;
     const auto warns = reslotWarnings();
@@ -1210,7 +1248,7 @@ void App::drawReslot() {
         std::string u = S("Se dejan sin cambiar ", "Left unchanged: ") + std::to_string(rs_.an.unknown.size()) + S(" ruta(s) que no se reconocen: ", " path(s) not recognised: ") + rs_.an.unknown[0];
         ui::text(u, x + 30, wy, ui::SMALL, col::dim, w - 60);
     }
-    ui::text(S("Arriba/Abajo Slot   Izq/Der Nuevo slot   X Restablecer   A Aplicar   B Cerrar", "Up/Down Slot   Left/Right New slot   X Reset   A Apply   B Close"), x, y + h - 40, ui::SMALL, col::dim, w, 1);
+    theme::hints(S("A Aplicar   Arr/Abj Slot   Izq/Der Nuevo   X Restablecer   B Cerrar", "A Apply   Up/Down Slot   Left/Right New   X Reset   B Close"), x + 28, y + h - 42, w - 56);
 }
 
 // ============================================================================ descargas
@@ -1237,7 +1275,7 @@ void App::updateDownloads(const Input& in) {
 
 void App::drawDownloads() {
     auto jobs = dl_.jobs();
-    ui::fill(0, HEAD, W, SUB, col::panel);
+    theme::subbar(HEAD, SUB, col::accent);
     ui::text(std::to_string(dl_.activeCount()) + S(" activas   -   ", " active   -   ") + std::to_string(jobs.size()) + S(" en total", " total"), 30, HEAD + 6, ui::SMALL, col::text, 800);
     uint64_t totalBps = 0;
     for (const auto& jb : jobs)
@@ -1254,14 +1292,14 @@ void App::drawDownloads() {
         const Job& j = *jobs[(size_t)i];
         int y = top + (i - first) * rowH;
         bool sel = i == dlSel_;
-        ui::fill(30, y, W - 60, rowH - 8, sel ? col::panelHi : col::panel);
-        if (sel) ui::outline(30, y, W - 60, rowH - 8, col::accent, 2);
         int s = j.state.load();
         ui::Color sc = s == Job::Done ? col::good : s == Job::Failed ? col::bad : s == Job::Cancelled ? col::dim : col::accent;
-        ui::text(j.item.name, 48, y + 6, ui::NORMAL, col::text, W - 120);
+        theme::row(30, y, W - 70, rowH - 10, sel, sc);
+        if (!sel) ui::fill(30, y, 4, rowH - 10, sc.withAlpha(150));  // el color de la barra indica el estado
+        ui::text(j.item.name, 52, y + 6, ui::NORMAL, sel ? col::white : col::text, W - 130);
         std::string sub = j.file.name + (j.file.size ? "  -  " + util::humanSize(j.file.size) : "") + (j.replaceFolder.empty() ? "" : S("  -  actualización", "  -  update"));
-        ui::text(sub, 48, y + 34, ui::SMALL, col::dim, W - 120);
-        ui::text(jobStateText(j), 48, y + 56, ui::SMALL, sc, W - 560);
+        ui::text(sub, 52, y + 34, ui::SMALL, col::dim, W - 130);
+        ui::text(jobStateText(j), 52, y + 56, ui::SMALL, sc, W - 570);
         if (s >= Job::Downloading && s <= Job::Extracting) drawBar(W - 520, y + 58, 450, 14, j.prog.fraction(), col::accent);
     }
     ui::scrollbar(W - 14, top, vis * rowH, vis * rowH, n * rowH, first * rowH);
@@ -1272,14 +1310,13 @@ void App::drawDownloads() {
 void App::updateProfiles(const Input& in) {
     auto names = store_.profileNames();
     if (in.y) {
-        std::string name;
-        if (platform::textInput(S("Nombre del perfil (guarda los mods activados ahora)", "Profile name (saves the currently enabled mods)"), "", name, 40)) {
-            name = util::trim(name);
-            if (!name.empty()) {
-                store_.saveProfile(name);
-                toast(S("Perfil guardado: ", "Profile saved: ") + name, col::good);
-            }
-        }
+        askText(S("Nombre del perfil (guarda los mods activados ahora)", "Profile name (saves the currently enabled mods)"), "", 40, false, [this](const std::string& text) {
+            const std::string name = util::trim(text);
+            if (name.empty()) return;
+            store_.saveProfile(name);
+            toast(S("Perfil guardado: ", "Profile saved: ") + name, col::good);
+        });
+        return;
     }
     if (names.empty()) return;
     moveSel(profSel_, (int)names.size(), 1, in);
@@ -1302,7 +1339,7 @@ void App::updateProfiles(const Input& in) {
 
 void App::drawProfiles() {
     auto names = store_.profileNames();
-    ui::fill(0, HEAD, W, SUB, col::panel);
+    theme::subbar(HEAD, SUB, col::accent);
     ui::text(S("Ahora: ", "Now: ") + std::to_string(store_.enabledCount()) + " / " + std::to_string(store_.mods().size()) + S(" mods activados", " mods enabled"), 30, HEAD + 6, ui::SMALL, col::text, 800);
     if (names.empty()) {
         drawCenterMessage(S("No hay perfiles", "No profiles"), S("Y: guardar los mods activados ahora como perfil (p. ej. \"Online\", \"Torneo\", \"Skins\")", "Y: save the currently enabled mods as a profile (e.g. \"Online\", \"Tournament\", \"Skins\")"), col::dim);
@@ -1315,16 +1352,15 @@ void App::drawProfiles() {
         const auto* list = store_.profile(names[(size_t)i]);
         int y = top + (i - first) * rowH;
         bool sel = i == profSel_;
-        ui::fill(30, y, W - 60, rowH - 8, sel ? col::panelHi : col::panel);
-        if (sel) ui::outline(30, y, W - 60, rowH - 8, col::accent, 2);
-        ui::text(names[(size_t)i], 48, y + 6, ui::NORMAL, col::text, 700);
+        theme::row(30, y, W - 70, rowH - 10, sel, col::accent);
+        ui::text(names[(size_t)i], 52, y + 6, ui::NORMAL, sel ? col::white : col::text, 700);
         int present = 0, missing = 0;
         if (list) {
             for (const auto& f : *list) (store_.findByFolder(f) >= 0 ? present : missing)++;
         }
         std::string sub = std::to_string(list ? list->size() : 0) + S(" mods", " mods");
         if (missing) sub += "   -   " + std::to_string(missing) + S(" ya no están instalados", " no longer installed");
-        ui::text(sub, 48, y + 34, ui::SMALL, missing ? col::warn : col::dim, W - 120);
+        ui::text(sub, 52, y + 34, ui::SMALL, missing ? col::warn : col::dim, W - 130);
     }
     ui::scrollbar(W - 14, top, vis * rowH, vis * rowH, n * rowH, first * rowH);
 }
@@ -1351,14 +1387,28 @@ std::string App::toolLabel(int idx, std::string& value) const {
         case 11: return S("Diagnóstico y registro", "Diagnostics and log");
         case 12: value = std::to_string(g_settings.dlConns); return S("Conexiones por descarga (más = más rápido)", "Connections per download (more = faster)");
         case 13: return S("Reslottear un mod (cambiar su slot c00-c07)", "Reslot a mod (change its c00-c07 slot)");
+        case 14: {
+            const int m = audio::mode();
+            value = !audio::available() ? S("Sin audio", "No audio") : m == audio::kChip ? S("Chiptune propio", "Built-in chiptune") : m == audio::kCustom ? S("Mis archivos (", "My files (") + std::to_string(audio::customCount()) + ")" : S("Desactivada", "Off");
+            return S("Música de fondo", "Background music");
+        }
+        case 15: value = std::to_string(g_settings.volume) + "%"; return S("Volumen de la música (izquierda/derecha)", "Music volume (left/right)");
+        case 16: value = audio::nowPlaying(); return S("Siguiente canción", "Next song");
+        case 17: value = g_settings.systemKeyboard && !platform::appletMode() ? S("Del sistema", "System") : S("En pantalla", "On-screen"); return S("Teclado para escribir", "Text keyboard");
         default: return S("Salir", "Exit");
     }
 }
 
-static constexpr int kToolCount = 15;
+static constexpr int kToolCount = 19;
 
 void App::updateTools(const Input& in) {
     moveSel(toolSel_, kToolCount, 1, in);
+    if (toolSel_ == 15 && (in.left || in.right)) {  // volumen: izquierda/derecha de 10 en 10
+        g_settings.volume = std::max(0, std::min(100, g_settings.volume + (in.right ? 10 : -10)));
+        audio::setVolume(g_settings.volume);
+        g_settings.save();
+        return;
+    }
     if (in.a) activateTool(toolSel_);
 }
 
@@ -1402,24 +1452,52 @@ void App::activateTool(int idx) {
             g_settings.keepArchives = !g_settings.keepArchives;
             g_settings.save();
             break;
-        case 9: {
-            std::string s;
-            if (platform::textInput(S("ID del juego en GameBanana (SSBU = 6498)", "GameBanana game ID (SSBU = 6498)"), std::to_string(g_settings.gameId), s, 8, true)) {
-                int id = atoi(s.c_str());
-                if (id > 0) {
-                    g_settings.gameId = id;
-                    g_settings.save();
-                    gb::setGameId(id);
-                    catId_ = 0;
-                    catName_.clear();
-                    page_ = gb::Page();
-                    pageLoaded_ = false;
-                    loadPage(1);
-                    toast(S("ID de juego actualizado", "Game ID updated"), col::good);
-                }
+        case 14: {
+            if (!audio::available()) {
+                toast(S("No se pudo iniciar el audio de la consola", "Could not start the console audio"), col::warn);
+                break;
             }
+            audio::rescan();
+            int next = (audio::mode() + 1) % 3;
+            if (next == audio::kCustom && audio::customCount() == 0) {
+                toast(S("No hay archivos .wav en switch/smash-mod-hub/music", "No .wav files in switch/smash-mod-hub/music"), col::warn);
+                next = audio::kOff;
+            }
+            g_settings.musicMode = audio::setMode(next);
+            g_settings.save();
             break;
         }
+        case 15:
+            g_settings.volume = g_settings.volume >= 100 ? 0 : g_settings.volume + 10;
+            audio::setVolume(g_settings.volume);
+            g_settings.save();
+            break;
+        case 16: audio::next(); break;
+        case 17:
+            if (platform::appletMode()) {
+                toast(S("Abierta desde el Álbum: el teclado del sistema puede congelar la consola, se usa el de pantalla", "Opened from the Album: the system keyboard can freeze the console, using the on-screen one"), col::warn);
+                break;
+            }
+            g_settings.systemKeyboard = !g_settings.systemKeyboard;
+            g_settings.save();
+            break;
+        case 9:
+            askText(S("ID del juego en GameBanana (SSBU = 6498)", "GameBanana game ID (SSBU = 6498)"), std::to_string(g_settings.gameId), 8, true, [this](const std::string& text) {
+                const int id = atoi(text.c_str());
+                if (id <= 0) return;
+                g_settings.gameId = id;
+                g_settings.save();
+                gb::setGameId(id);
+                catId_ = 0;
+                catName_.clear();
+                page_ = gb::Page();
+                pageLoaded_ = false;
+                pageCache_.clear();
+                pageOrder_.clear();
+                loadPage(1);
+                toast(S("ID de juego actualizado", "Game ID updated"), col::good);
+            });
+            break;
         case 10:
             img_.clearDisk();
             gb::clearCategoryCache();
@@ -1497,26 +1575,33 @@ void App::showDiagnostics() {
 }
 
 void App::drawTools() {
-    const int rowH = 38, top = HEAD + 8;
-    for (int i = 0; i < kToolCount; i++) {
+    const int rowH = 40, top = HEAD + 10, vis = (H - FOOT - top - 8) / rowH;
+    const int first = std::max(0, std::min(kToolCount - vis, toolSel_ - vis / 2));
+    for (int i = first; i < kToolCount && i < first + vis; i++) {
         std::string value;
-        std::string label = toolLabel(i, value);
-        int y = top + i * rowH;
-        bool sel = i == toolSel_;
-        ui::fill(30, y, W - 60, rowH - 6, sel ? col::panelHi : col::panel);
-        if (sel) ui::outline(30, y, W - 60, rowH - 6, col::accent, 2);
-        ui::text(label, 48, y + 5, ui::NORMAL, col::text, W - 420);
-        if (!value.empty()) ui::text(value, W - 360, y + 5, ui::NORMAL, col::accent, 310, 2);
+        const std::string label = toolLabel(i, value);
+        const int y = top + (i - first) * rowH;
+        const bool sel = i == toolSel_;
+        theme::row(30, y, W - 60, rowH - 6, sel, col::accent);
+        ui::text(label, 54, y + 6, ui::NORMAL, sel ? col::white : col::text, W - 430);
+        if (!value.empty()) ui::text(value, W - 370, y + 6, ui::NORMAL, col::accent, 320, 2);
     }
+    if (kToolCount > vis) ui::scrollbar(W - 20, top, vis * rowH - 6, vis, kToolCount, first);
 }
 
 // ============================================================================ piezas de interfaz
 
 void App::drawBar(int x, int y, int w, int h, double frac, ui::Color c) {
-    ui::fill(x, y, w, h, col::bg);
+    ui::fill(x, y, w, h, ui::Color(8, 9, 14));
     if (frac < 0) frac = 0;
     if (frac > 1) frac = 1;
-    ui::fill(x, y, (int)(w * frac), h, c);
+    const int fw = (int)(w * frac);
+    if (fw > 0) {
+        ui::fill(x, y, fw, h, c);
+        ui::fill(x, y, fw, std::max(1, h / 3), ui::Color(255, 255, 255, 52));  // brillo superior
+        if (fw > 3 && fw < w) ui::fill(x + fw - 2, y, 2, h, ui::Color(255, 255, 255, 120));  // borde de avance
+    }
+    ui::outline(x, y, w, h, ui::Color(255, 255, 255, 22), 1);
 }
 
 void App::drawCenterMessage(const std::string& title, const std::string& sub, ui::Color c) {
@@ -1525,6 +1610,7 @@ void App::drawCenterMessage(const std::string& title, const std::string& sub, ui
 }
 
 void App::drawCard(int x, int y, int w, int h, const Card& c) {
+    theme::shadow(x, y, w, h, c.selected ? 9 : 5);
     ui::fill(x, y, w, h, c.selected ? col::panelHi : col::panel);
     const int ih = w * 9 / 16;
     ui::fill(x, y, w, ih, col::placeholder);
@@ -1537,40 +1623,64 @@ void App::drawCard(int x, int y, int w, int h, const Card& c) {
         ui::fill(x, y, w, ih, ui::Color(255, 255, 255, (uint8_t)pulse));
     }
     if (c.dim) ui::fill(x, y, w, ih, ui::Color(0, 0, 0, 150));
-    int bx = x + 8;
+    ui::fill(x, y + ih - 18, w, 18, ui::Color(0, 0, 0, 46));  // sombra suave bajo la imagen
+    ui::fill(x, y + ih, w, c.selected ? 4 : 2, c.selected ? col::accent : ui::Color(0, 0, 0, 90));
+    int bx = x + 6;
     for (const auto& b : c.badges) {
-        int bw = ui::textWidth(b.text, ui::SMALL) + 16;
-        ui::fill(bx, y + 8, bw, 24, b.col);
-        ui::text(b.text, bx + 8, y + 8, ui::SMALL, kInk);
-        bx += bw + 6;
+        const int bw = ui::textWidth(b.text, ui::SMALL) + 20;
+        if (bx + bw + 8 > x + w) break;
+        theme::slant(bx, y + 8, bw, 24, 8, b.col);
+        ui::text(b.text, bx + 8, y + 8, ui::SMALL, kInk, bw, 1);
+        bx += bw + 12;
     }
-    int ty = y + ih + 6;
+    int ty = y + ih + 8;
     ui::text(c.title, x + 10, ty, ui::NORMAL, col::text, w - 20);
     ty += ui::lineHeight(ui::NORMAL);
     ui::text(c.l2, x + 10, ty, ui::SMALL, col::dim, w - 20);
     ty += ui::lineHeight(ui::SMALL);
     ui::text(c.l3, x + 10, ty, ui::SMALL, col::dim, w - 20);
-    if (c.selected) ui::outline(x - 3, y - 3, w + 6, h + 6, col::accent, 3);
+    if (c.selected) theme::glow(x, y, w, h, col::accent);
 }
 
 void App::drawHeader() {
     ui::fill(0, 0, W, HEAD, col::header);
-    ui::text("SMASH MOD HUB", 28, 14, ui::BIG, col::accent);
-    const int tabW = 150, x0 = 300;
-    ui::text("L", x0 - 30, 18, ui::NORMAL, col::dim);
+    ui::fill(0, HEAD - 2, W, 2, col::accent.withAlpha(80));
+    // logotipo: bloque de color inclinado con el nombre
+    theme::slant(-40, 0, 300, HEAD - 2, 22, col::accent);
+    ui::text("SMASH MOD HUB", 22, 7, ui::NORMAL, col::white, 240);
+    ui::text("SMASH MOD HUB", 23, 7, ui::NORMAL, col::white, 240);  // doble trazo: negrita barata (misma textura en caché)
+    ui::text(std::string("v") + APP_VERSION_STR, 24, 35, ui::SMALL, ui::Color(255, 255, 255, 205));
+    // pestañas: cada una mide lo que mide su texto (así "Herramientas" no se corta); si no caben, se reduce el margen
+    const int x0 = 298, avail = 768;
+    std::string names[TAB_COUNT];
+    int tw[TAB_COUNT], sumTw = 0;
     for (int t = 0; t < TAB_COUNT; t++) {
-        int x = x0 + t * tabW;
-        bool act = t == tab_;
-        ui::text(tabName(t), x, 18, ui::NORMAL, act ? col::text : col::dim, tabW - 6, 1);
-        if (act) ui::fill(x + 8, HEAD - 6, tabW - 22, 4, col::accent);
+        names[t] = tabName(t);
+        tw[t] = ui::textWidth(names[t], ui::NORMAL);
+        sumTw += tw[t];
     }
-    ui::text("R", x0 + TAB_COUNT * tabW + 8, 18, ui::NORMAL, col::dim);
-    ui::text("ON " + std::to_string(store_.enabledCount()) + "/" + std::to_string(store_.mods().size()), W - 150, 18, ui::NORMAL, col::good, 130, 2);
+    const int pad = std::max(8, std::min(36, (avail - sumTw) / TAB_COUNT));
+    theme::chip(x0 - 32, 20, "L");
+    int x = x0;
+    for (int t = 0; t < TAB_COUNT; t++) {
+        const int w = tw[t] + pad;
+        const bool act = t == tab_;
+        if (act) {
+            theme::slant(x + 2, 10, w - 6, HEAD - 22, 14, col::accent);
+            ui::fill(x + 16, 10, w - 6, 2, ui::Color(255, 255, 255, 70));
+        }
+        ui::text(names[t], x + 4, 18, ui::NORMAL, act ? col::white : col::dim, w - 8, 1);
+        x += w;
+    }
+    theme::chip(x + 6, 20, "R");
+    theme::equalizer(W - 170, 19, 29, 26, audio::level(), now_, audio::available() && audio::mode() != audio::kOff);
+    ui::text("ON " + std::to_string(store_.enabledCount()) + "/" + std::to_string(store_.mods().size()), W - 136, 18, ui::NORMAL, col::good, 116, 2);
 }
 
 void App::drawFooter(const std::string& hints) {
     ui::fill(0, H - FOOT, W, FOOT, col::header);
-    ui::text(hints, 24, H - FOOT + 11, ui::SMALL, col::dim, W - 300);
+    ui::fill(0, H - FOOT, W, 2, col::accent.withAlpha(80));
+    theme::hints(hints, 20, H - FOOT + 9, W - 300);
     if (freeSpace_) ui::text(S("SD libre: ", "SD free: ") + util::humanSize(freeSpace_), W - 270, H - FOOT + 11, ui::SMALL, col::dim, 250, 2);
 }
 
@@ -1596,33 +1706,35 @@ void App::drawMain() {
 
 void App::drawToast() {
     if (now_ >= toastUntil_ || toastMsg_.empty()) return;
-    int tw = std::min(W - 80, ui::textWidth(toastMsg_, ui::NORMAL) + 48);
-    int x = (W - tw) / 2, y = H - FOOT - 62;
+    const int tw = std::min(W - 80, ui::textWidth(toastMsg_, ui::NORMAL) + 56);
+    // con una ventana grande abierta (categorías, reslot, detalle) los atajos ocupan la parte izquierda: el aviso va a la derecha
+    const bool overlay = cp_.open || rs_.open || detailOpen_;
+    const int x = overlay ? std::max(40, W - 50 - tw) : (W - tw) / 2, y = H - FOOT - 64;
     // se desvanece en los últimos 400 ms
     const uint64_t left = toastUntil_ - now_;
     const int a = left >= 400 ? 255 : (int)(255 * left / 400);
-    ui::fill(x, y, tw, 46, ui::Color(8, 9, 14, (uint8_t)(235 * a / 255)));
-    ui::outline(x, y, tw, 46, toastCol_.withAlpha((uint8_t)a), 2);
-    ui::text(toastMsg_, x, y + 8, ui::NORMAL, toastCol_.withAlpha((uint8_t)a), tw, 1);
+    ui::fill(x - 2, y + 4, tw + 4, 50, ui::Color(0, 0, 0, (uint8_t)(70 * a / 255)));
+    ui::fill(x, y, tw, 46, ui::Color(10, 11, 18, (uint8_t)(240 * a / 255)));
+    ui::fill(x, y, 8, 46, toastCol_.withAlpha((uint8_t)a));
+    ui::fill(x + 8, y, tw - 8, 1, toastCol_.withAlpha((uint8_t)(a * 90 / 255)));
+    ui::text(toastMsg_, x + 8, y + 9, ui::NORMAL, col::text.withAlpha((uint8_t)a), tw - 8, 1);
 }
 
 void App::drawDialog() {
     ui::fill(0, 0, W, H, ui::Color(0, 0, 0, 170));
     const int w = 760, h = 270, x = (W - w) / 2, y = (H - h) / 2;
-    ui::fill(x, y, w, h, col::panel);
-    ui::outline(x, y, w, h, col::accent, 3);
-    ui::text(dialog_.title, x + 28, y + 20, ui::BIG, col::text, w - 56);
-    ui::textWrapped(dialog_.msg, x + 28, y + 80, w - 56, ui::NORMAL, col::dim, 0, h - 150);
-    ui::text(dialog_.confirm ? S("A  Aceptar        B  Cancelar", "A  Accept        B  Cancel") : S("A  Aceptar", "A  OK"), x, y + h - 48, ui::NORMAL, col::accent, w, 1);
+    theme::panel(x, y, w, h, col::accent);
+    ui::text(dialog_.title, x + 28, y + 26, ui::BIG, col::text, w - 56);
+    ui::textWrapped(dialog_.msg, x + 28, y + 86, w - 56, ui::NORMAL, col::dim, 0, h - 156);
+    theme::hints(dialog_.confirm ? S("A Aceptar   B Cancelar", "A Accept   B Cancel") : S("A Aceptar", "A OK"), x + 20, y + h - 46, w - 40, true);
 }
 
 void App::drawView() {
     ui::fill(0, 0, W, H, ui::Color(0, 0, 0, 200));
     const int x = 50, y = 30, w = W - 100, h = H - 60;
-    ui::fill(x, y, w, h, col::panel);
-    ui::outline(x, y, w, h, col::accent, 3);
-    ui::text(view_.title, x + 24, y + 14, ui::BIG, col::text, w - 48);
-    const int ay = y + 70, ah = h - 120, lh = ui::lineHeight(ui::SMALL);
+    theme::panel(x, y, w, h, col::accent);
+    ui::text(view_.title, x + 24, y + 22, ui::BIG, col::text, w - 48);
+    const int ay = y + 74, ah = h - 128, lh = ui::lineHeight(ui::SMALL);
     ui::clip(x + 10, ay, w - 20, ah);
     int first = std::max(0, (int)(view_.scroll / lh));
     for (int i = first; i < (int)view_.lines.size(); i++) {
@@ -1631,17 +1743,93 @@ void App::drawView() {
         ui::text(view_.lines[(size_t)i], x + 24, ly, ui::SMALL, col::text, w - 48);
     }
     ui::unclip();
-    ui::text(S("Arriba/Abajo o stick: desplazar        B: cerrar", "Up/Down or stick: scroll        B: close"), x, y + h - 40, ui::SMALL, col::dim, w, 1);
+    theme::hints(S("Arriba/Abajo Desplazar   B Cerrar", "Up/Down Scroll   B Close"), x + 20, y + h - 44, w - 40, true);
 }
 
 void App::drawBusyOverlay(const std::string& msg, double frac) {
     ui::fill(0, 0, W, H, ui::Color(0, 0, 0, 170));
-    const int w = 700, h = 170, x = (W - w) / 2, y = (H - h) / 2;
-    ui::fill(x, y, w, h, col::panel);
-    ui::outline(x, y, w, h, col::accent, 3);
-    ui::text(msg, x, y + 26, ui::NORMAL, col::text, w, 1);
+    const int w = 700, h = 176, x = (W - w) / 2, y = (H - h) / 2;
+    theme::panel(x, y, w, h, col::accent);
+    ui::text(msg, x + 20, y + 30, ui::NORMAL, col::text, w - 40, 1);
     drawBar(x + 40, y + 80, w - 80, 20, frac, col::accent);
-    ui::text(S("B  Cancelar", "B  Cancel"), x, y + 120, ui::SMALL, col::dim, w, 1);
+    theme::hints(S("B Cancelar", "B Cancel"), x + 20, y + 126, w - 40, true);
+}
+
+// ---- teclado en pantalla
+
+void App::askText(const std::string& title, const std::string& initial, int maxLen, bool numeric, std::function<void(const std::string&)> done) {
+    // El teclado del sistema bloquea el hilo principal hasta que se cierra y, abierta la app desde el Álbum
+    // (modo applet), puede dejar la consola congelada: por eso el teclado propio es el predeterminado.
+    if (g_settings.systemKeyboard && !platform::appletMode()) {
+        std::string out;
+        if (platform::textInput(title, initial, out, maxLen, numeric) && done) done(out);
+        return;
+    }
+    oskDone_ = std::move(done);
+    osk_.open(title, initial, maxLen, numeric);
+}
+
+void App::updateOsk(const Input& in) {
+    const osk::Result r = osk_.update(in);
+    if (r == osk::Result::None) return;
+    auto cb = std::move(oskDone_);
+    oskDone_ = nullptr;
+    if (r == osk::Result::Accepted && cb) cb(osk_.text());
+}
+
+void App::drawOsk() {
+    const osk::Geometry g = osk_.geometry();
+    const bool num = osk_.numeric();
+    ui::fill(0, 0, W, H, ui::Color(0, 0, 0, 190));
+    const int pw = num ? 800 : 1080, px = (W - pw) / 2, py = 30, ph = H - FOOT - py - 6;
+    theme::panel(px, py, pw, ph, col::accent);
+    ui::text(osk_.title(), px + 28, py + 26, ui::BIG, col::text, pw - 56 - 130);
+    ui::text(std::to_string(osk_.length()) + "/" + std::to_string(osk_.maxLen()), px + pw - 160, py + 36, ui::SMALL, col::dim, 132, 2);
+    // campo de texto con cursor parpadeante
+    const int fx = g.x, fy = py + 100, fw = g.w, fh = 64;
+    ui::fill(fx, fy, fw, fh, col::bg);
+    ui::fill(fx, fy + fh - 3, fw, 3, col::accent);
+    ui::outline(fx, fy, fw, fh, ui::Color(255, 255, 255, 28), 1);
+    const int ty = fy + (fh - ui::lineHeight(ui::NORMAL)) / 2 - 2;
+    ui::text(osk_.text(), fx + 16, ty, ui::NORMAL, col::text, fw - 32);
+    if ((now_ / 500) % 2 == 0) {
+        const int cx = std::min(fx + fw - 14, fx + 16 + ui::textWidth(osk_.beforeCursor(), ui::NORMAL));
+        ui::fill(cx, fy + 12, 2, fh - 24, col::accent);
+    }
+    // teclas
+    const auto boxes = osk_.layout();
+    for (const auto& b : boxes) {
+        const osk::Key& k = osk_.rows()[(size_t)b.row][(size_t)b.col];
+        const bool sel = b.row == osk_.selRow() && b.col == osk_.selCol();
+        std::string label;
+        ui::Color base = col::panelHi;
+        switch (k.kind) {
+            case osk::Kind::Char: label = osk_.shown(k); break;
+            case osk::Kind::Shift:
+                label = S("Mayús", "Shift");
+                if (osk_.shift()) base = ui::Color(176, 56, 80);
+                break;
+            case osk::Kind::Symbols: label = osk_.symbols() ? "ABC" : S("Símbolos", "Symbols"); break;
+            case osk::Kind::Space: label = S("Espacio", "Space"); break;
+            case osk::Kind::Back: label = S("Borrar", "Delete"); break;
+            case osk::Kind::Cancel:
+                label = S("Cancelar", "Cancel");
+                base = ui::Color(104, 40, 52);
+                break;
+            case osk::Kind::Accept:
+                label = S("Aceptar", "OK");
+                base = ui::Color(34, 104, 68);
+                break;
+        }
+        ui::fill(b.x, b.y + 3, b.w, b.h, ui::Color(0, 0, 0, 110));  // borde inferior: da relieve de tecla
+        ui::fill(b.x, b.y, b.w, b.h, sel ? col::accent : base);
+        ui::fill(b.x, b.y, b.w, 2, ui::Color(255, 255, 255, sel ? 80 : 36));
+        if (sel) ui::outline(b.x - 2, b.y - 2, b.w + 4, b.h + 4, col::white, 2);
+        ui::text(label, b.x, b.y + (b.h - ui::lineHeight(ui::NORMAL)) / 2 - 1, ui::NORMAL, col::text, b.w - 6, 1);
+    }
+    theme::hints(num ? S("A Escribir   B Borrar   + Aceptar   - Cancelar", "A Type   B Delete   + OK   - Cancel")
+                     : S("A Escribir   B Borrar   X Espacio   Y Mayús   L/R Cursor   + Aceptar   - Cancelar   (o toca la pantalla)", "A Type   B Delete   X Space   Y Shift   L/R Cursor   + OK   - Cancel   (or touch the screen)"),
+                 px + 20, py + ph - 46, pw - 40, true);
 }
 
 // ============================================================================ bucle principal
@@ -1714,12 +1902,21 @@ void App::frame(const Input& in) {
     }
     if (tab_ == TAB_TOOLS && importDirty_) refreshImportCount();
     img_.pump();
+    audio::pump();
+    {
+        const std::string ae = audio::lastError();
+        if (ae != audioErr_) {
+            audioErr_ = ae;
+            if (!ae.empty()) toast(S("Música: ", "Music: ") + ae, col::warn);
+        }
+    }
     pollAsync();
     handleFinishedJobs();
     browseScroll_.step();
     instScroll_.step();
 
-    if (dialog_.open) updateDialog(in);
+    if (osk_.isOpen()) updateOsk(in);
+    else if (dialog_.open) updateDialog(in);
     else if (view_.open) updateView(in);
     else if (confJob_.busy.load()) {
         if (in.b) confCancel_ = true;
@@ -1732,6 +1929,7 @@ void App::frame(const Input& in) {
 
     SDL_SetRenderDrawColor(ren_, col::bg.r, col::bg.g, col::bg.b, 255);
     SDL_RenderClear(ren_);
+    theme::background(now_);
     if (detailOpen_) drawDetail();
     else drawMain();
     if (confJob_.busy.load()) drawBusyOverlay(S("Buscando conflictos... ", "Scanning for conflicts... ") + std::to_string(confDone_.load()) + "/" + std::to_string(confTotal_), confTotal_ ? (double)confDone_.load() / confTotal_ : 0.0);
@@ -1739,6 +1937,7 @@ void App::frame(const Input& in) {
     if (rs_.open) drawReslot();
     if (rs_.applying) drawBusyOverlay(S("Reslot en curso... ", "Reslotting... ") + std::to_string(rsDone_.load()) + "/" + std::to_string(rsTotal_.load()), rsTotal_.load() ? (double)rsDone_.load() / rsTotal_.load() : 0.0);
     if (view_.open) drawView();
+    if (osk_.isOpen()) drawOsk();
     drawToast();
     if (dialog_.open) drawDialog();
     ui::endFrame();

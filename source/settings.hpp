@@ -8,6 +8,9 @@ struct Settings {
     bool verifyMd5 = true;      // comprobar MD5 si GameBanana lo informa
     int perPage = 20;           // resultados por página
     int dlConns = 4;            // conexiones en paralelo para descargar un archivo (1 = una sola)
+    bool systemKeyboard = false;  // usar el teclado del sistema (bloqueante) en vez del propio en pantalla
+    int musicMode = 1;          // música: 0 = desactivada, 1 = chiptune propio, 2 = archivos .wav de la SD
+    int volume = 60;            // volumen de la música, 0-100
 
     void load();
     void save() const;

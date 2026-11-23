@@ -4,6 +4,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace ui {
 
@@ -49,6 +51,9 @@ void imageContain(SDL_Texture* t, int x, int y, int w, int h);  // entra entera 
 
 // Barra de desplazamiento fina (x,y,h = pista; viewH/contentH/pos en píxeles del contenido).
 void scrollbar(int x, int y, int h, int viewH, int contentH, int pos, Color c = col::dim);
+
+// Parte una línea de atajos ("A Ver   Y Buscar   ZL/ZR Pág.") en pares (botón, texto). El separador son 3 o más espacios.
+std::vector<std::pair<std::string, std::string>> splitHints(const std::string& s);
 
 void clip(int x, int y, int w, int h);
 void unclip();

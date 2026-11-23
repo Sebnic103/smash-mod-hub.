@@ -8,4 +8,7 @@ struct Input {
     bool plus = false, minus = false;
     bool up = false, down = false, left = false, right = false;
     float stickY = 0.f;  // stick derecho vertical: -1 (arriba) .. 1 (abajo)
+    bool bRep = false;   // B con repetición al mantenerla (borrar texto en el teclado en pantalla)
+    bool tap = false;    // toque en la pantalla táctil en este frame, en coordenadas de 1280x720
+    int tapX = 0, tapY = 0;
 };

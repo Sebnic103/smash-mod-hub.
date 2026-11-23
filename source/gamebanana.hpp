@@ -76,6 +76,10 @@ int gameId();
 
 Page browse(int page, Sort sort, int perPage);
 Page search(const std::string& query, int page, int perPage);
+// Una búsqueda larga en curso (plan B) se detiene en cuanto se llama a esto; devuelve ok=false, err="cancelada".
+void cancelSearch();
+// Progreso de la búsqueda larga: páginas escaneadas / total (0/0 si no hay ninguna en curso).
+void searchProgress(int& done, int& total);
 
 // --- Filtros por categoría
 // Hijos de una categoría (parent 0 = categorías raíz del juego). Usa caché (memoria + disco, 24 h) y, si la API

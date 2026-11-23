@@ -10,7 +10,9 @@ los mods con su miniatura y los instala en `sd:/ultimate/mods` para que los carg
 
 | | |
 |---|---|
-| **Explorar GameBanana** | Cuadrícula con miniaturas, orden (destacados / nuevos / actualizados), búsqueda con el teclado del sistema, paginación |
+| **Explorar GameBanana** | Cuadrícula con miniaturas, orden (destacados / nuevos / actualizados), búsqueda con **teclado en pantalla propio** (mando o táctil), paginación |
+| **Interfaz nueva** *(1.3)* | Fondo animado suave, pestañas y botones inclinados estilo juego de lucha, sombras, chips de botones, ecualizador. Todo con rectángulos y una sola textura de fondo: no cuesta rendimiento |
+| **Música de fondo** *(1.3)* | 3 canciones chiptune **originales** generadas por la propia app, o tus archivos `.wav` de `switch/smash-mod-hub/music/`. Volumen y siguiente canción en Herramientas |
 | **Filtros por categoría** *(nuevo)* | Los mismos filtros de GameBanana: categorías (Skins, Efectos, Sonidos, Final Smash...) y dentro de cada una sus subcategorías (cada personaje). Se combinan con el orden y la búsqueda |
 | **Reslotter** *(nuevo)* | Cambia el slot (c00–c07) de un mod de personaje renombrando sus archivos: modelos, animaciones, cámara, efectos, sonidos y retratos. Con vista previa, aviso de choques con otros mods y deshacer automático si algo falla |
 | **Ficha del mod** | Galería de capturas, descripción, autor, categoría, fechas, descargas/likes, lista de archivos con tamaño |
@@ -39,9 +41,41 @@ los mods con su miniatura y los instala en `sd:/ultimate/mods` para que los carg
 | `-` | Volver al inicio, quitar búsqueda y filtro, y refrescar (Explorar) · Buscar actualizaciones (Instalados) |
 | Stick der. | Desplazar la descripción |
 | `+` | Salir |
+| Pantalla táctil | Tocar las teclas del teclado en pantalla |
 
 > Ábrelo con **título secuestrado** (mantén `R` al pulsar un juego en el menú de homebrew) para tener toda la RAM;
-> desde el álbum puede quedarse corto con listas largas de imágenes.
+> desde el álbum (modo applet) hay muy poca memoria: la app lo detecta, usa su teclado propio y se recomienda no abrir
+> listas muy largas.
+
+## Teclado en pantalla (arregla el congelamiento al buscar)
+
+Antes, al buscar se abría el teclado del sistema, que **bloquea el hilo principal** hasta cerrarse y, si la app estaba
+abierta desde el Álbum (modo applet), a veces dejaba la consola congelada. Ahora la app trae su propio teclado, que no
+bloquea nada:
+
+| Botón | En el teclado |
+|---|---|
+| Cruceta / stick | Mover entre teclas · `A` pulsar tecla |
+| `B` (mantener) | Borrar (se repite) · `X` espacio · `Y` mayúsculas/minúsculas |
+| `L` / `R` | Cursor a izquierda/derecha · `ZL` / `ZR` inicio/final |
+| `+` | Aceptar · `-` Cancelar |
+
+Hay una página de símbolos con acentos y `ñ ¿ ¡`, y un teclado numérico para el ID del juego. También se puede tocar la
+pantalla. Si prefieres el del sistema: *Herramientas → Teclado para escribir* (en modo applet se mantiene el propio).
+
+Además, la búsqueda está acotada: si el servidor tarda, tiene un tope de tiempo y de páginas, se puede cancelar
+(cambiando la búsqueda o con `-`), muestra el progreso ("Buscando "mario" - página 2/4") y las páginas siguientes no
+repiten el escaneo.
+
+## Música y fondo propios
+
+- *Herramientas → Música de fondo*: **Apagada / Chiptune propio / Mis archivos**. Volumen (izquierda/derecha) y *Siguiente canción*.
+- **Mis archivos:** copia tus `.wav` (PCM 8/16/24/32 bits o float, mono/estéreo, hasta 32 MB cada uno) a
+  `sd:/switch/smash-mod-hub/music/`. Si no hay ninguno, se vuelve al chiptune.
+- **Fondo propio:** pon `background.png` (o `.jpg`) en `sd:/switch/smash-mod-hub/` (máx. 12 MB). Se recorta a 16:9 y se
+  oscurece solo para que el texto se lea.
+- La música y las imágenes de Nintendo/Smash Bros. **no se incluyen** (tienen copyright); las canciones del chiptune están
+  compuestas para este proyecto. Si no hay audio disponible, la app sigue sin música (no es un error).
 
 ## Filtros por categoría
 
@@ -136,6 +170,8 @@ sd:/ultimate/mods_disabled/      mods desactivados por Smash Mod Hub
 sd:/switch/smash-mod-hub/
     mods.json                    metadatos (id de GameBanana, miniatura, archivo instalado, perfiles)
     settings.json                ajustes
+    music/                       (opcional) tus .wav para la música de fondo
+    background.png|jpg           (opcional) tu imagen de fondo
     thumbs/ cache/ downloads/    miniaturas, caché de imágenes, archivos descargados
     import/                      deja aquí tus .zip/.7z/.rar para instalarlos
     log.txt                      registro (se recorta solo)
@@ -178,7 +214,10 @@ sd:/switch/smash-mod-hub/
 - La descarga por trozos (orden, reintentos, cancelación, disco lleno, servidor sin `Range`) y la lógica de texto de la
   interfaz (ajuste de línea, reparto por frames, caché) también tienen tests (`tests/run.sh`), con detector de errores
   de memoria y de carreras entre hilos.
-- La interfaz SDL2, el mando/teclado de libnx y el enlazado final **solo se han comprobado sintácticamente** contra
+- El teclado en pantalla (escritura, acentos, cursor, límites, táctil), el sintetizador (notas, acordes, que no se sature ni
+  tenga desfase de continua), el cargador de WAV (formatos válidos e inválidos) y la búsqueda acotada/cancelable tienen tests.
+  La apariencia nueva se revisó dibujando la interfaz real a imágenes en el equipo de desarrollo.
+- La interfaz SDL2, el audio real de SDL en la consola, el táctil, el mando/teclado de libnx y el enlazado final **solo se han comprobado sintácticamente** contra
   cabeceras de prueba; las velocidades reales dependen de tu red y del servidor, y no se han podido medir aquí.
 - Los endpoints de GameBanana (API v11) se tomaron de documentación y proyectos de terceros; no pudieron probarse
   en vivo desde el entorno donde se escribió el código. Si algún endpoint cambia, el registro (`log.txt`) muestra la URL y el error.

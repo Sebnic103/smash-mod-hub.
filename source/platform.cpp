@@ -16,8 +16,8 @@ namespace platform {
 
 struct Pad::Impl {
     PadState pad;
-    uint64_t holdSince[4] = {0, 0, 0, 0};
-    uint64_t lastRepeat[4] = {0, 0, 0, 0};
+    uint64_t holdSince[5] = {0, 0, 0, 0, 0};
+    uint64_t lastRepeat[5] = {0, 0, 0, 0, 0};
 };
 
 Pad::Pad() : impl_(new Impl) {}
@@ -46,10 +46,11 @@ Input Pad::poll() {
     in.minus = down & HidNpadButton_Minus;
 
     // Cruceta + stick izquierdo, con repetición (400 ms de espera, luego cada 90 ms).
-    const u64 masks[4] = {HidNpadButton_Up | HidNpadButton_StickLUp, HidNpadButton_Down | HidNpadButton_StickLDown, HidNpadButton_Left | HidNpadButton_StickLLeft, HidNpadButton_Right | HidNpadButton_StickLRight};
-    bool* out[4] = {&in.up, &in.down, &in.left, &in.right};
+    // B también repite (borrar texto en el teclado en pantalla); el resto de la app usa solo in.b (flanco).
+    const u64 masks[5] = {HidNpadButton_Up | HidNpadButton_StickLUp, HidNpadButton_Down | HidNpadButton_StickLDown, HidNpadButton_Left | HidNpadButton_StickLLeft, HidNpadButton_Right | HidNpadButton_StickLRight, HidNpadButton_B};
+    bool* out[5] = {&in.up, &in.down, &in.left, &in.right, &in.bRep};
     const uint64_t now = sys::nowMs();
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 5; i++) {
         if (held & masks[i]) {
             if (down & masks[i]) {
                 impl_->holdSince[i] = now;
@@ -94,6 +95,11 @@ void cpuBoost(bool on) {
     if (smh_cpuBoostMode) smh_cpuBoostMode(on ? 1u : 0u);  // 1 = FastLoad, 0 = desactivado; el resultado se ignora
 }
 
+bool appletMode() {
+    const AppletType t = appletGetAppletType();
+    return t == AppletType_LibraryApplet || t == AppletType_SystemApplet || t == AppletType_OverlayApplet;
+}
+
 bool textInput(const std::string& header, const std::string& initial, std::string& out, int maxLen, bool numeric) {
     SwkbdConfig kbd;
     if (R_FAILED(swkbdCreate(&kbd, 0))) return false;
@@ -119,6 +125,7 @@ Pad::~Pad() { delete impl_; }
 void Pad::init() {}
 Input Pad::poll() { return Input(); }
 std::string firmwareVersion() { return ""; }
+bool appletMode() { return false; }
 bool textInput(const std::string&, const std::string&, std::string&, int, bool) { return false; }
 void cpuBoost(bool) {}
 

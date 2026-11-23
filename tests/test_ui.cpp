@@ -133,6 +133,24 @@ int main() {
     CHECK(g_created - g_destroyed <= 900 + 16);
     CHECK(g_destroyed > 0);
 
+    // ---- atajos del pie de página: "A Ver   Y Buscar   ZL/ZR Pág."
+    {
+        auto h = ui::splitHints("A Ver   Y Buscar   ZL/ZR Pág.   - Inicio");
+        CHECK(h.size() == 4);
+        CHECK(h[0].first == "A" && h[0].second == "Ver");
+        CHECK(h[1].first == "Y" && h[1].second == "Buscar");
+        CHECK(h[2].first == "ZL/ZR" && h[2].second == "Pág.");
+        CHECK(h[3].first == "-" && h[3].second == "Inicio");
+        h = ui::splitHints("A Reintentar a fondo   X Cancelar/Quitar");
+        CHECK(h.size() == 2 && h[0].second == "Reintentar a fondo" && h[1].second == "Cancelar/Quitar");
+        CHECK(ui::splitHints("").empty());
+        CHECK(ui::splitHints("   ").empty());
+        h = ui::splitHints("  A Ver      B Atrás   ");
+        CHECK(h.size() == 2 && h[0].first == "A" && h[1].first == "B" && h[1].second == "Atrás");
+        h = ui::splitHints("Solo");
+        CHECK(h.size() == 1 && h[0].first == "Solo" && h[0].second.empty());
+    }
+
     ui::shutdown();
     printf(g_fail ? "UI: %d FALLOS\n" : "UI: TODO OK\n", g_fail);
     return g_fail ? 1 : 0;

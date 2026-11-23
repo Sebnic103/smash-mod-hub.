@@ -14,6 +14,7 @@
 #include "imagecache.hpp"
 #include "input.hpp"
 #include "modstore.hpp"
+#include "osk.hpp"
 #include "reslot.hpp"
 #include "ui.hpp"
 
@@ -178,6 +179,11 @@ private:
     void runImport();
     void showDiagnostics();
 
+    // --- teclado en pantalla (no bloquea: es una capa más de la interfaz)
+    void askText(const std::string& title, const std::string& initial, int maxLen, bool numeric, std::function<void(const std::string&)> done);
+    void updateOsk(const Input& in);
+    void drawOsk();
+
     // --- piezas de interfaz
     void updateMain(const Input& in);
     void drawMain();
@@ -256,12 +262,15 @@ private:
 
     // descargas / perfiles / herramientas
     int dlSel_ = 0, profSel_ = 0, toolSel_ = 0;
+    std::string audioErr_;  // último error de música ya avisado
     Async<ConflictRes> confJob_;
     std::atomic<int> confDone_{0};
     std::atomic<bool> confCancel_{false};
     int confTotal_ = 0;
 
     // superposiciones
+    osk::Keyboard osk_;
+    std::function<void(const std::string&)> oskDone_;
     Dialog dialog_;
     TextView view_;
     std::string toastMsg_;

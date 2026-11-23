@@ -295,24 +295,55 @@ static Page feedPage(int64_t catId, int pg) {
     return f;
 }
 
-// Filtra en local las primeras páginas del feed (de una categoría o del juego entero).
-static Page localSearch(int64_t catId, const std::string& query, int maxPages) {
+// Búsquedas largas (plan B): cancelación y progreso para la interfaz. Sin esto, escanear varias páginas parecía un
+// cuelgue (no había nada que ver) y una búsqueda nueva tenía que esperar a que acabara la anterior.
+static std::atomic<int> g_searchGen{0}, g_scanDone{0}, g_scanTotal{0};
+
+void cancelSearch() { g_searchGen++; }
+
+void searchProgress(int& done, int& total) {
+    done = g_scanDone.load();
+    total = g_scanTotal.load();
+}
+
+// Filtra en local las primeras páginas del feed (de una categoría o del juego entero). Se detiene si se pide otra
+// cosa (cancelSearch) y, pasado deadlineMs, devuelve lo que lleve encontrado en vez de seguir escaneando.
+static Page localSearch(int64_t catId, const std::string& query, int maxPages, uint64_t deadlineMs) {
     Page out;
     out.page = 1;
     const std::string q = util::lower(query);
+    const int gen = g_searchGen.load();
+    const uint64_t t0 = sys::nowMs();
+    g_scanDone = 0;
+    g_scanTotal = maxPages;
     bool anyOk = false;
     for (int pg = 1; pg <= maxPages; pg++) {
+        if (g_searchGen.load() != gen) {
+            out.err = "cancelada";
+            out.ok = false;
+            return out;
+        }
+        if (anyOk && deadlineMs && sys::nowMs() - t0 > deadlineMs) {
+            util::log("search: límite de tiempo (%llu ms), se devuelve lo encontrado en %d páginas", (unsigned long long)(sys::nowMs() - t0), pg - 1);
+            break;
+        }
         Page f = feedPage(catId, pg);
         if (!f.ok) {
             if (!anyOk) out.err = f.err;
             break;
         }
         anyOk = true;
+        g_scanDone = pg;
         out.scanned += (int)f.items.size();
         for (auto& it : f.items) {
             if (util::lower(it.name).find(q) != std::string::npos || util::lower(it.author).find(q) != std::string::npos || util::lower(it.category()).find(q) != std::string::npos) out.items.push_back(it);
         }
         if (f.complete || f.items.empty()) break;
+    }
+    if (g_searchGen.load() != gen) {
+        out.err = "cancelada";
+        out.ok = false;
+        return out;
     }
     out.ok = anyOk;
     out.complete = true;
@@ -321,12 +352,20 @@ static Page localSearch(int64_t catId, const std::string& query, int maxPages) {
 }
 
 Page search(const std::string& query, int page, int perPage) {
+    g_scanDone = 0;
+    g_scanTotal = 0;
     std::string url = std::string(kApi) + "/Util/Search/Results?_sSearchString=" + util::urlEncode(query) + "&_idGameRow=" + std::to_string(g_gameId) + "&_sModelName=Mod&_nPage=" + std::to_string(page) + "&_nPerpage=" + std::to_string(perPage);
     Page p = fetchPage(url, page);
     if (p.ok && !p.items.empty()) return p;
-    // Plan B: si el buscador no responde como se espera, filtramos las primeras páginas del feed del juego.
-    util::log("search: plan B (filtrado local) para '%s' (%s)", query.c_str(), p.ok ? "sin resultados" : p.err.c_str());
-    return localSearch(0, query, 6);
+    if (page > 1) {  // no hay más páginas de resultados: no se repite la búsqueda local (devolvía la página 1 otra vez)
+        if (p.ok) p.complete = true;
+        return p;
+    }
+    // Plan B para la primera página. Si el buscador falló se escanean hasta 4 páginas del feed (máx. 20 s); si contestó
+    // "sin resultados" se mira solo lo más reciente (2 páginas, máx. 8 s) por si el buscador se quedó corto.
+    const bool failed = !p.ok;
+    util::log("search: plan B (filtrado local) para '%s' (%s)", query.c_str(), failed ? p.err.c_str() : "sin resultados");
+    return localSearch(0, query, failed ? 4 : 2, failed ? 20000 : 8000);
 }
 
 // ------------------------------------------------------------ filtros por categoría
@@ -356,7 +395,7 @@ Page browseCategory(int64_t catId, int page, Sort sort, int perPage) {
     return fetchPage(base, page);
 }
 
-Page searchInCategory(int64_t catId, const std::string& query) { return localSearch(catId, query, 8); }
+Page searchInCategory(int64_t catId, const std::string& query) { return localSearch(catId, query, 8, 25000); }
 
 // --- listado de categorías
 bool parseCategories(const json::Value& root, std::vector<Category>& out, bool* complete) {

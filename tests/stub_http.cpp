@@ -1,4 +1,5 @@
 // Sustituto de http.cpp para los tests del host: devuelve respuestas enlatadas.
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
@@ -7,6 +8,7 @@
 
 std::map<std::string, std::string> g_canned;       // url (prefijo) -> cuerpo
 std::vector<std::string> g_requested;              // urls pedidas
+std::function<void(const std::string&)> g_onGet;   // gancho opcional: se llama en cada petición (los tests lo usan para cancelar)
 
 namespace http {
 std::string Result::describe() const { return error.empty() ? "HTTP " + std::to_string(status) : error; }
@@ -19,6 +21,7 @@ void dropIdle() {}
 
 Result get(const std::string& url, std::string& body, Progress*, long) {
     g_requested.push_back(url);
+    if (g_onGet) g_onGet(url);
     Result r;
     for (const auto& kv : g_canned) {
         // Clave terminada en '$' = la URL debe ser exactamente esa; si no, basta con que empiece así.

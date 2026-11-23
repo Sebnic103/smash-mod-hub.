@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdio>
+#include <functional>
 #include <cstdlib>
 #include <atomic>
 #include <chrono>
@@ -20,6 +21,7 @@
 #include "../source/util.hpp"
 
 extern std::map<std::string, std::string> g_canned;
+extern std::function<void(const std::string&)> g_onGet;
 extern std::vector<std::string> g_requested;
 
 static int g_fail = 0;
@@ -183,6 +185,41 @@ static void testGb() {
         int feedReqs = 0;
         for (size_t i = before; i < g_requested.size(); i++) feedReqs += g_requested[i].find("Subfeed?_nPage=1&") != std::string::npos ? 1 : 0;  // la página 1 ya está en caché
         CHECK(feedReqs == 0);
+    }
+    {  // el buscador contesta bien pero sin resultados: la página 2 NO repite la búsqueda local (devolvía la página 1 otra vez)
+        g_canned.clear();
+        gb::clearFeedCache();
+        g_canned["https://gamebanana.com/apiv11/Util/Search/Results"] = R"({"_aMetadata":{"_bIsComplete":true},"_aRecords":[]})";
+        g_canned["https://gamebanana.com/apiv11/Game/6498/Subfeed?_nPage=1"] = feed;
+        g_requested.clear();
+        gb::Page e2 = gb::search("zzz", 2, 20);
+        CHECK(e2.ok && e2.items.empty() && e2.complete);
+        CHECK(g_requested.size() == 1);
+        // la página 1 sí mira lo más reciente (como mucho 2 páginas) y avisa del progreso
+        g_requested.clear();
+        gb::Page e1 = gb::search("mario", 1, 20);
+        CHECK(e1.ok && e1.items.size() == 1 && e1.scanned > 0);
+        int d = -1, t = -1;
+        gb::searchProgress(d, t);
+        CHECK(t == 2 && d >= 1 && d <= 2);
+        int feedReqs = 0;
+        for (const auto& u : g_requested) feedReqs += u.find("Subfeed") != std::string::npos ? 1 : 0;
+        CHECK(feedReqs <= 2);
+        // pedir otra cosa cancela la búsqueda larga en curso
+        gb::clearFeedCache();
+        g_canned.clear();  // el buscador falla -> plan B de 4 páginas
+        g_canned["https://gamebanana.com/apiv11/Game/6498/Subfeed?_nPage=1"] = feed;
+        g_onGet = [](const std::string& u) {
+            if (u.find("Subfeed") != std::string::npos) gb::cancelSearch();
+        };
+        gb::Page cx = gb::search("mario", 1, 20);
+        g_onGet = nullptr;
+        CHECK(!cx.ok && cx.err == "cancelada");
+        gb::clearFeedCache();
+        gb::Page again = gb::search("mario", 1, 20);  // y la siguiente búsqueda funciona con normalidad
+        CHECK(again.ok && again.items.size() == 1);
+        g_canned.clear();
+        g_canned["https://gamebanana.com/apiv11/Game/6498/Subfeed?_nPage=1"] = feed;
     }
     gb::Page b = gb::browse(1, gb::Sort::New, 20);
     CHECK(b.ok && b.items.size() == 2);

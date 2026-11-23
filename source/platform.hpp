@@ -27,6 +27,10 @@ std::string firmwareVersion();
 // (descomprimir 7z/RAR es trabajo de CPU). Sin efecto si el sistema no lo permite.
 void cpuBoost(bool on);
 
+// true si la app corre como applet (abierta desde el Álbum): tiene menos memoria y no puede abrir otras applets
+// con seguridad. Conviene abrir los homebrew con un juego (mantener R al lanzar un juego).
+bool appletMode();
+
 // Teclado del sistema. false si el usuario cancela o no está disponible.
 bool textInput(const std::string& header, const std::string& initial, std::string& out, int maxLen = 60, bool numeric = false);
 
