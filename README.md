@@ -4,7 +4,7 @@ Gestor **y** descargador de mods para **Super Smash Bros. Ultimate** en Switch c
 Es un homebrew `.nro` que se abre desde el Homebrew Menu, se conecta a **GameBanana**, descarga
 los mods con su miniatura y los instala en `sd:/ultimate/mods` para que los cargue **ARCropolis**.
 
-> Hecho para uso con ARCropolis + Skyline ya instalados. No instala plugins ni toca tu `atmosphere/`.
+> Hecho con IA para uso con ARCropolis + Skyline ya instalados. No instala plugins ni toca tu `atmosphere/`.
 
 ## Funciones
 
